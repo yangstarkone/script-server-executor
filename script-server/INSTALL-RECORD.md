@@ -524,8 +524,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ops restart
   `...\Python312\python.exe "C:\ScriptServer\script-server\deploy\serve.py"`；watchdog State=Ready（每 1 分钟）。
 - 修复：`cutover-to-uvicorn-task.ps1` 增加 `Find-Python`（固定候选路径优先），规避 `WindowsApps\python.exe`
   0 字节 Store 存根——本机 machine PATH 中存根排在真实 Python 前，原 `Get-Command python` 会取到存根。
-- PM2：daemon 未运行（`~\.pm2\pm2.pid` 陈旧、`pids\script-server-0.pid` 停在 10/23），无 PM2 自启任务/Run 键；
-  `node.exe` 进程数安装前后均 5（属 DSH 等其它软件，不是本服务）。
-- 未做：真实重启自启验证、防火墙 9000 规则、平台设备登记；`~\.pm2` 残留未清理。
+- PM2：重装时发现 daemon 实际仍在运行（pid 26412，`...\npm\node_modules\pm2\lib\Daemon.js`；被 DSH 沙箱隐藏），
+  已于 17:46 卸载（见 10.10）；`node.exe` 进程数随后减少 1，其余属 WorkBuddy/紫鸟等软件。
+- 未做：真实重启自启验证、防火墙 9000 规则、平台设备登记。
 - 证据：`C:\ScriptServer\logs\reinstall-report.log`、`logs\cutover.log`、`script-server\logs\verify-result.json`。
+
+### 10.10 2026-10-27 17:46 卸载 PM2
+
+- 原因：执行器已由计划任务托管，PM2 属旧架构遗留（`npm ls -g` 显示 `pm2@7.1.0`）。
+- 发现：daemon 实际在运行（pid 26412）；本轮早期用普通 shell 的 `Get-Process` 看不到 node.exe，
+  误判"daemon 未运行"，已纠正——DSH 沙箱会隐藏进程，必须用提权脚本的 `Win32_Process` 查。
+- 操作：提权 `taskkill /F /T /PID 26412` → 删除 `~\.pm2`、`...\npm\node_modules\pm2`、11 个 `pm2*` shim
+  （等价 `npm uninstall -g pm2`，直接删目录，不依赖 npm）。
+- 结果：`where pm2` 无结果、`npm ls -g` 无 pm2、无 pm2 计划任务/服务/Run 键；执行器未受影响
+  （`/health` 200、主任务 Running，进程未重启）。
+- 保留：`ecosystem.config.js`、`start-script-server.bat.pm2-bak` 仅作回退参考；node/npm 与其它全局包未动。
+- 证据：`C:\ScriptServer\logs\pm2-uninstall-report2.log`、`logs\pm2-uninstall-transcript.log`。
 

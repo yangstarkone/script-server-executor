@@ -13,9 +13,9 @@
 - 能跑通：`deploy\verify-10.ps1` 10/10（2026-10-27 重装后实测；2026-10-26 亦两次通过，Stop/Start 冷启动等价测试通过）。
 - 不能跑通：无。
 - 未验证：**真实重启后的开机自启**（未重启本机）；平台侧「设备管理」登记与「检测」在线（需在平台操作）。
-- 已知问题：当前网络位置=公用配置文件且**防火墙关闭**（域配置文件为开启），未加 9000 放行规则；旧 PM2 残留 `~\.pm2`（daemon 未运行、无自启任务/Run 键，仅占空间）；DSH 沙箱里 `Get-NetTCPConnection`/`Get-ScheduledTask`/CIM 被拒，端口/任务状态不可在本 shell 里判断，以 `/health` 与提权脚本为准。
-- 环境事实：`E:\workflow-scripts-center` **存在**（约 1.7 万文件，2026-10-26 同步），`.env` 的 `WF_ALLOWED_SCRIPT_ROOTS` 白名单有效。
-- 下一步：① 真实重启一次并按 `INSTALL-RECORD.md` §6 清单核对；② 平台登记 `base_url=http://192.168.1.220:9000` + `.env` 的 token；③ 需要的话启用防火墙并只放行平台 IP/网段；④ 需要的话清理 `~\.pm2` 残留。
+- 已知问题：当前网络位置=公用配置文件且**防火墙关闭**（域配置文件为开启），未加 9000 放行规则；PM2 已于 2026-10-27 17:46 完全卸载（daemon/模块/命令/`~\.pm2` 全清，无自启项）；DSH 沙箱里 `Get-NetTCPConnection`/`Get-ScheduledTask`/`Get-CimInstance`/`Get-Process` 均不可信（会隐藏 node 进程、CIM 被拒），端口/任务/进程状态必须用提权脚本或 `/health` 判断。
+- 环境事实：`E:\workflow-scripts-center` **存在**（约 1.7 万文件，2026-10-26 同步），`.env` 的 `WF_ALLOWED_SCRIPT_ROOTS` 白名单有效；本机 `node.exe` 进程属于 WorkBuddy、紫鸟等其它软件，不是执行器/PM2。
+- 下一步：① 真实重启一次并按 `INSTALL-RECORD.md` §6 清单核对；② 平台登记 `base_url=http://192.168.1.220:9000` + `.env` 的 token；③ 需要的话启用防火墙并只放行平台 IP/网段。
 - 版本管理：GitHub 私有仓库 `script-server-executor`（main；`.env`、`logs/`、`.script_server_state/` 不入库）。
 - 最后更新：2026-10-27
 
@@ -27,6 +27,15 @@
 ---
 
 ## 日志（新→旧）
+
+### 2026-10-27 卸载 PM2（全局包 + daemon + 数据目录）
+
+- 背景：PM2 属旧架构遗留；执行器已改计划任务托管，PM2 只剩残留。
+- 发现：PM2 **daemon 实际在运行**（pid 26412，`C:\nvm4w\nodejs\node.exe ...\npm\node_modules\pm2\lib\Daemon.js`）。普通 shell 看不到 node.exe（DSH 沙箱隐藏进程），只有提权脚本的 `Win32_Process` 才能发现——之前"daemon 未运行"的判断是错的，已纠正。
+- 做法（UAC 提权脚本）：`taskkill /F /T /PID 26412` → 删除 `~\.pm2` → 删除 `...\npm\node_modules\pm2` 与 11 个 `pm2*` shim（等价 `npm uninstall -g pm2`，不依赖 npm）。第一次尝试在 `npm ls` 后异常中断、未改动系统，第二次用直接删除完成。
+- 结果：`where pm2` 无结果、`Get-Command pm2` 为 0、`npm ls -g` 不再含 pm2；无 pm2 计划任务/服务/Run 键；`~\.pm2` 已不存在。执行器 `/health` 200、任务 Running（进程未重启，uptime 连续）。
+- 未动：node/npm、其它全局包（dsh/ziniao-cli/pnpm/windows-build-tools）、仓库里的 `ecosystem.config.js` 与 `start-script-server.bat.pm2-bak`（仅回退参考）。
+- 证据：`logs\pm2-uninstall-report2.log`、`logs\pm2-uninstall-transcript.log`。
 
 ### 2026-10-27 用新安装器重装执行器（install.bat，替换旧 PM2 时代安装）
 
