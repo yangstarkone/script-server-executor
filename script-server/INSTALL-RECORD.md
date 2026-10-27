@@ -516,3 +516,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ops restart
 # 或双击 deploy\install-autostart-uvicorn.bat 重新注册并启动
 ```
 
+### 10.9 2026-10-27 用新安装器重装（install.bat + watchdog）
+
+- 时间：2026-10-27 17:41（Asia/Shanghai）；方式：`install.bat -nopause`（UAC 提权）→ `deploy\cutover-to-uvicorn-task.ps1`。
+- 替换：旧计划任务实例 pid 4148（旧版 `serve.py`）被结束；重新注册并启动新任务 pid 30884，`/health` 200。
+- 结果：`verify-10.ps1` **10/10 PASS**；主任务 State=Running（Boot 触发 / S4U / Highest），动作
+  `...\Python312\python.exe "C:\ScriptServer\script-server\deploy\serve.py"`；watchdog State=Ready（每 1 分钟）。
+- 修复：`cutover-to-uvicorn-task.ps1` 增加 `Find-Python`（固定候选路径优先），规避 `WindowsApps\python.exe`
+  0 字节 Store 存根——本机 machine PATH 中存根排在真实 Python 前，原 `Get-Command python` 会取到存根。
+- PM2：daemon 未运行（`~\.pm2\pm2.pid` 陈旧、`pids\script-server-0.pid` 停在 10/23），无 PM2 自启任务/Run 键；
+  `node.exe` 进程数安装前后均 5（属 DSH 等其它软件，不是本服务）。
+- 未做：真实重启自启验证、防火墙 9000 规则、平台设备登记；`~\.pm2` 残留未清理。
+- 证据：`C:\ScriptServer\logs\reinstall-report.log`、`logs\cutover.log`、`script-server\logs\verify-result.json`。
+
