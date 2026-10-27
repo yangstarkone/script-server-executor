@@ -17,7 +17,22 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
 $Root      = Split-Path -Parent $PSScriptRoot        # ...\script-server
-$Python    = (Get-Command python -ErrorAction SilentlyContinue).Source
+function Find-Python {
+    # Prefer a real interpreter; the WindowsApps "python.exe" alias is a 0-byte Store stub.
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python311\python.exe'),
+        'C:\Program Files\Python312\python.exe',
+        'C:\Program Files\Python311\python.exe'
+    )
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -notmatch 'WindowsApps') { return $cmd.Source }
+    return $null
+}
+$Python    = Find-Python
 $ServePy   = Join-Path $PSScriptRoot 'serve.py'
 $LogFile   = Join-Path (Split-Path -Parent $Root) 'logs\cutover.log'
 $Base      = "http://127.0.0.1:$Port"
