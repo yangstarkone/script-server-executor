@@ -1,0 +1,15 @@
+# 本机凭据：.env 含 WF_SCRIPT_TOKEN，只保留模板 .env.example
+.env
+.env.*
+!.env.example
+
+# 运行时状态与日志：含业务输出、历史结果、机器路径，不入库
+logs/
+.script_server_state/
+*.log
+
+# Python 缓存 / 虚拟环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
