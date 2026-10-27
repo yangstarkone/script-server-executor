@@ -14,7 +14,8 @@
 - 未验证：**真实重启后的开机自启**（未重启本机）；平台侧「设备管理」登记与「检测」在线（需在平台操作）。
 - 已知问题：当前网络位置=公用配置文件且**防火墙关闭**，未加 9000 放行规则；`.env` 里的 `WF_ALLOWED_SCRIPT_ROOTS=C:\workflow-scripts-center` 在本机不存在该目录（仅白名单，暂无害）。
 - 下一步：① 真实重启一次并按 `INSTALL-RECORD.md` §6 清单核对；② 平台登记 `base_url=http://192.168.1.220:9000` + `.env` 的 token；③ 需要的话启用防火墙并只放行平台 IP/网段。
-- 最后更新：2026-10-26
+- 版本管理：GitHub 私有仓库 `script-server-executor`（main，2026-10-27 首次推送；`.env`、`logs/`、`.script_server_state/` 不入库）。
+- 最后更新：2026-10-27
 
 ## 待确认问题
 
@@ -24,6 +25,15 @@
 ---
 
 ## 日志（新→旧）
+
+### 2026-10-27 初始化 Git 与 GitHub 私有仓库（安装前留档）
+
+- 目标：把当前 `C:\ScriptServer` 纳入版本管理，安装/改造前留下可回滚基线。
+- 结论：已推送到 https://github.com/yangstarkone/script-server-executor（PRIVATE，main），首提交 30 文件 `2133a5a`。
+- 改：新增 `.gitignore`（排除 `.env`、`logs/`、`.script_server_state/`、`__pycache__/`、`*.log`）与 `README.md`；`script-server/INSTALL-RECORD.md` 第 47 行真实 token 改为占位符；`git init -b main`，仓库内身份 `yangstarkone <yangstarkone@users.noreply.github.com>`。
+- 敏感信息检查：独立只读审计 PASS——索引内无凭据（真实 token 零命中、无硬编码默认 token），远端树无 `.env`/日志/状态目录；文档保留内网 IP、主机名、`Administrator` 等 LOW 信息（仓库 private，暂不处理）。
+- 坑：① Git for Windows 走 schannel 访问 GitHub 报 `SEC_E_NO_CREDENTIALS`；② credential helper `!gh auth git-credential` 在 DSH 受限环境起不了 sh（signal pipe Win32 5）。可行推送法：`http.sslBackend=openssl` + 用 `GIT_CONFIG_*` 环境变量注入 `http.extraHeader="Authorization: Basic base64(x-access-token:<gh token>)"`，token 不进 argv、不落盘。
+- 遗留：未加 gitleaks/secret scanning；`script-server/start-script-server.bat.pm2-bak` 作为历史备份一并提交。
 
 ### 2026-10-26 在新机 YANGSTARONE 装好 script-server 执行器（无 PM2）
 
