@@ -60,8 +60,13 @@ def load_env(path: Path) -> None:
             os.environ[key] = value
 
 
-def _rotating_handler(path: Path, level: int, when: str, backup_count: int) -> TimedRotatingFileHandler:
-    """按天轮转的文件 handler：到点把当前文件改名为 <name>.YYYY-MM-DD，保留 backup_count 份。"""
+def _rotating_handler(path: Path, level: int, when: str, backup_count: int,
+                      fmt: str = LOG_FORMAT) -> TimedRotatingFileHandler:
+    """按天轮转的文件 handler：到点把当前文件改名为 <name>.YYYY-MM-DD，保留 backup_count 份。
+
+    fmt 默认带“时间 级别 logger:”前缀；审计日志传 "%(message)s"，让每行就是纯 JSON，
+    便于 grep/jq 直接解析（JSON 自身已带 ts 字段）。
+    """
     handler = TimedRotatingFileHandler(
         path,
         when=when,
@@ -70,7 +75,7 @@ def _rotating_handler(path: Path, level: int, when: str, backup_count: int) -> T
         encoding="utf-8",
     )
     handler.setLevel(level)
-    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    handler.setFormatter(logging.Formatter(fmt))
     return handler
 
 
@@ -97,7 +102,8 @@ def setup_logging(
         access = _rotating_handler(log_dir / ACCESS_LOG, logging.INFO, when, backup_count)
         service = _rotating_handler(log_dir / SERVICE_LOG, logging.INFO, when, backup_count)
         error = _rotating_handler(log_dir / ERROR_LOG, logging.ERROR, when, backup_count)
-        audit = _rotating_handler(log_dir / AUDIT_LOG, logging.INFO, when, backup_count)
+        audit = _rotating_handler(log_dir / AUDIT_LOG, logging.INFO, when, backup_count,
+                                  fmt="%(message)s")
     except OSError as exc:
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
         logging.getLogger("serve").warning(

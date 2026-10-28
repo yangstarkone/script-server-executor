@@ -7,7 +7,7 @@
   支持取消正在运行的脚本（POST /cancel/{task_id}）。
   客户端断开时默认取消执行（可关闭，见 WF_CANCEL_ON_DISCONNECT）。
 
-幂等与重试（2026-10-28 / 3.3.0）:
+幂等与重试（2026-10-28 / 3.3.0，3.3.1 修订）:
   - 幂等键 = task_run_id（可选，调用方提供）；不传则每次都是新任务、不做任何去重。
   - 命中条件 = 同一 task_run_id + 同一请求指纹。指纹含 脚本路径、args、env、超时、
     **脚本内容 sha256** → 脚本改动后同一 task_run_id 会重新执行，不会返回旧结果。
@@ -49,7 +49,7 @@
    cancelled, timed_out, deduplicated, truncated, duration_seconds}
   code 三态（平台判定用，与 exit_code 互补）:
     200 = 成功；500 = 失败/取消/脚本内部错误；502 = 超时（进程已终止）
-  HTTP 层错误仍用状态码: 400 参数、401 鉴权、403 路径、409 同 task_id 运行中、429 繁忙、503 排空。
+  HTTP 层错误仍用状态码: 400 参数、401 鉴权、403 路径、409 同 task_id 运行中、429 繁忙/排队已满、503 排空。
 
 取消 (POST /cancel/{task_id]):
   杀掉正在运行的脚本进程树（先 taskkill /F /T，失败再 kill 主进程）。
@@ -61,7 +61,8 @@
 
 稳定性相关环境变量:
   WF_MAX_CONCURRENCY=4            并发执行上限，超出返回 429（带 Retry-After）
-  WF_QUEUE_MAX_WAIT_SECONDS=30    block_strategy=queue 时最多排队等待秒数（同时不超过本次 timeout）
+    WF_QUEUE_MAX_WAIT_SECONDS=30    block_strategy=queue 时最多排队等待秒数（同时不超过本次 timeout）
+  WF_QUEUE_MAX_DEPTH=16           block_strategy=queue 的排队上限（0=不限制；满了立即 429，不再等待）
   WF_MAX_OUTPUT_BYTES=8388608     单流 stdout/stderr 捕获上限（超出截断并置 truncated）
   WF_RESULT_CACHE_TTL=86400       已完成结果缓存秒数
   WF_RESULT_CACHE_MAX_FILES=2000  结果缓存文件数上限
@@ -120,7 +121,7 @@ logger = logging.getLogger(__name__)
 # 业务审计（一次运行一行 JSON）：由 deploy\serve.py 挂到 logs\script-server-audit.log
 audit_logger = logging.getLogger("audit")
 
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 
 
 def _audit(event: str, **fields) -> None:
@@ -243,7 +244,10 @@ if _WORKERS > 1:
 
 
 async def require_token(request: Request) -> None:
-    """FastAPI 依赖：校验 X-Script-Token（未配置 token 时直接放行）。"""
+    """FastAPI 依赖：校验 X-Script-Token（未配置 token 时直接放行）。
+
+    3.3.1：鉴权失败写审计并计数——token 等于主机控制权，失败尝试必须可追溯。
+    """
     if not _SCRIPT_TOKEN:
         return
     import secrets
@@ -253,7 +257,15 @@ async def require_token(request: Request) -> None:
         auth = request.headers.get("Authorization") or ""
         if auth.startswith("Bearer "):
             supplied = auth[7:].strip()
-    if not supplied or not secrets.compare_digest(supplied, _SCRIPT_TOKEN):
+    if not supplied:
+        _bump("auth_failed")
+        _audit("auth.fail", client=_client_ip(request), path=request.url.path,
+               reason="missing_token")
+        raise HTTPException(status_code=401, detail="invalid or missing X-Script-Token")
+    if not secrets.compare_digest(supplied, _SCRIPT_TOKEN):
+        _bump("auth_failed")
+        _audit("auth.fail", client=_client_ip(request), path=request.url.path,
+               reason="bad_token", token_len=len(supplied))
         raise HTTPException(status_code=401, detail="invalid or missing X-Script-Token")
 
 
@@ -287,6 +299,8 @@ except OSError as _state_exc:  # 只读盘/权限问题：降级为无幂等模�
 # ── 资源上限 / 策略 ────────────────────────────────
 _MAX_CONCURRENCY = max(1, _env_int("WF_MAX_CONCURRENCY", 4))
 _QUEUE_MAX_WAIT = max(1, _env_int("WF_QUEUE_MAX_WAIT_SECONDS", 30))
+# 排队上限：默认 16；0 = 不限制（不建议，排队请求会一直占着连接等空槽）。
+_QUEUE_MAX_DEPTH = max(0, _env_int("WF_QUEUE_MAX_DEPTH", 16))
 _MAX_OUTPUT_BYTES = max(64 * 1024, _env_int("WF_MAX_OUTPUT_BYTES", 8 * 1024 * 1024))
 _RESULT_CACHE_TTL = max(60, _env_int("WF_RESULT_CACHE_TTL", 24 * 3600))
 _RESULT_CACHE_MAX_FILES = max(10, _env_int("WF_RESULT_CACHE_MAX_FILES", 2000))
@@ -352,6 +366,10 @@ def _sanitize_env_extra(env_extra: dict) -> dict:
         if not isinstance(key, str) or not _ENV_KEY_RE.match(key):
             rejected.append(str(key))
             continue
+        # 3.3.1：NUL 会让 CreateProcess 抛 ValueError（变成服务端异常），入口直接拒绝
+        if not isinstance(value, str) or "\x00" in value:
+            rejected.append(key)
+            continue
         up = key.upper()
         if up in _HARD_DENY_ENV or up.startswith("WF_SCRIPT_") or up in deny_upper:
             rejected.append(key)
@@ -401,6 +419,8 @@ _METRICS = {
     "run_kill_failed": 0,
     "rejected_busy": 0,
     "queued": 0,
+    "queue_timeout": 0,
+    "queue_full_rejected": 0,
     "conflict_409": 0,
     "deduplicated": 0,
     "spawn_errors": 0,
@@ -408,6 +428,8 @@ _METRICS = {
     "kill_failed": 0,
     "disconnect_cancelled": 0,
     "orphans_killed_at_startup": 0,
+    "auth_failed": 0,
+    "path_denied": 0,
     "drain_rejected": 0,
 }
 
@@ -433,10 +455,14 @@ class _TaskHandle:
         timeout_seconds: int,
         started_at: float,
         started_monotonic: float,
+        args_len: int = 0,
+        args_sha: str = "",
     ) -> None:
         self.task_id = task_id
         self.script_path = script_path
         self.cmd = cmd
+        self.args_len = args_len
+        self.args_sha = args_sha
         self.timeout_seconds = timeout_seconds
         self.started_at = started_at
         self.started_monotonic = started_monotonic
@@ -485,6 +511,48 @@ def _reset_slots() -> None:
     global _free_slots
     with _slots_lock:
         _free_slots = _MAX_CONCURRENCY
+
+
+# ── 排队登记（3.3.1）────────────────────────────────
+# 只有 block_strategy=queue 且没抢到槽的请求才登记；/tasks 能直接看到“在等槽”的请求，
+# 不再出现“槽满被拒前完全不可见”的黑盒。上限由 WF_QUEUE_MAX_DEPTH 控制。
+_queue_lock = threading.Lock()
+_queue_waiters: Dict[str, dict] = {}
+
+
+def _queue_enter(task_id: str, script: str) -> Optional[str]:
+    """登记一个排队请求；队列已满返回 None。"""
+    key = uuid.uuid4().hex
+    with _queue_lock:
+        if _QUEUE_MAX_DEPTH and len(_queue_waiters) >= _QUEUE_MAX_DEPTH:
+            return None
+        _queue_waiters[key] = {"task_id": task_id, "script": script, "since": time.monotonic()}
+    return key
+
+
+def _queue_leave(key: Optional[str]) -> None:
+    if not key:
+        return
+    with _queue_lock:
+        _queue_waiters.pop(key, None)
+
+
+def _queue_depth() -> int:
+    with _queue_lock:
+        return len(_queue_waiters)
+
+
+def _queue_snapshot() -> List[dict]:
+    now = time.monotonic()
+    with _queue_lock:
+        return [
+            {
+                "task_id": item["task_id"],
+                "script": item["script"],
+                "waited_seconds": round(now - item["since"], 1),
+            }
+            for item in _queue_waiters.values()
+        ]
 
 
 def _active_handles() -> List[_TaskHandle]:
@@ -544,7 +612,9 @@ def _snapshot_running() -> dict:
                 "started_at": handle.started_at,
                 "script": str(handle.script_path),
                 "timeout_seconds": handle.timeout_seconds,
-                "cmd": handle.cmd,
+                # 3.3.1：台账不再落完整 argv（可能含敏感参数），只留可对照的摘要
+                "args_len": handle.args_len,
+                "args_sha": handle.args_sha,
             }
             for task_id, handle in task_manager.items()
         }
@@ -1187,6 +1257,7 @@ async def health():
         "auth_required": bool(_SCRIPT_TOKEN),
         "draining": _DRAINING,
         "running_tasks": len(_active_handles()),
+        "queue": {"depth": _queue_depth(), "limit": _QUEUE_MAX_DEPTH},
         "uptime_seconds": _uptime_seconds(),
         "counters": dict(_METRICS),
     }
@@ -1229,6 +1300,7 @@ async def health_ready():
         "auth_required": bool(_SCRIPT_TOKEN),
         "draining": _DRAINING,
         "running_tasks": len(_active_handles()),
+        "queue": {"depth": _queue_depth(), "limit": _QUEUE_MAX_DEPTH},
         "uptime_seconds": _uptime_seconds(),
         "checks": checks,
         "counters": dict(_METRICS),
@@ -1262,7 +1334,7 @@ async def drain(timeout: int = 30):
 
 
 @app.post("/scan", dependencies=[Depends(require_token)])
-async def scan_directory(dir_path: str = ""):
+async def scan_directory(dir_path: str = "", request: Request = None):
     """扫描目录，返回所有 .py 文件列表。"""
     if not dir_path:
         return {"files": []}
@@ -1273,6 +1345,9 @@ async def scan_directory(dir_path: str = ""):
         raise HTTPException(400, f"不是目录: {dir_path}")
     resolved = p.resolve()
     if not any(resolved.is_relative_to(root) for root in _SCAN_ROOTS):
+        _bump("path_denied")
+        _audit("path.deny", client=_client_ip(request), script=str(dir_path)[:200],
+               reason="scan_root")
         raise HTTPException(
             403,
             "目录不在允许的扫描根内：默认只允许 WF_SCRIPTS_DIR。"
@@ -1315,7 +1390,11 @@ async def run(req: RunRequest, request: Request = None):
     # 1) 参数/路径校验（快速失败，不占用并发槽；先于幂等查询，避免缓存绕过校验）
     try:
         script_path = _resolve_path(req.file_path)
-    except HTTPException:
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            _bump("path_denied")
+            _audit("path.deny", client=client_ip, script=str(req.file_path)[:200],
+                   reason=str(exc.detail)[:160])
         raise
     except Exception as exc:
         raise HTTPException(400, f"脚本路径无效: {exc}")
@@ -1323,6 +1402,8 @@ async def run(req: RunRequest, request: Request = None):
         raise HTTPException(400, f"脚本不存在: {script_path}")
     if not script_path.is_file():
         raise HTTPException(400, f"不是文件: {script_path}")
+    if "\x00" in (req.args or ""):
+        raise HTTPException(400, "args 包含 NUL 字符，无法传给子进程")
     args_list = _split_args(req.args)
     if sum(len(x) for x in args_list) > 65536:
         raise HTTPException(413, "args 过大（>64KB）")
@@ -1354,15 +1435,33 @@ async def run(req: RunRequest, request: Request = None):
                 logger.warning("缓存结果损坏，忽略并重新执行（task=%s）: %s", task_id, exc)
 
     # 3) 并发槽：reject=立即 429（带 Retry-After）；queue=排队等空槽，最多 WF_QUEUE_MAX_WAIT 秒
+    #    排队有上限（WF_QUEUE_MAX_DEPTH，默认 16）并登记到 _queue_waiters，/tasks 可见。
     queue_started = time.monotonic()
+    queue_key: Optional[str] = None
     got_slot = _try_acquire_slot()
     if not got_slot and req.block_strategy == "queue":
+        queue_key = _queue_enter(task_id, script_path.name)
+        if queue_key is None:
+            _bump("queue_full_rejected")
+            _audit("run.reject", reason="queue_full", client=client_ip, run_id=task_id,
+                   explicit=explicit_id, script=script_path.name,
+                   queue_depth=_queue_depth(), queue_limit=_QUEUE_MAX_DEPTH)
+            raise HTTPException(
+                429,
+                f"排队已满（上限 {_QUEUE_MAX_DEPTH}），请稍后重试",
+                headers={"Retry-After": "5"},
+            )
         deadline = queue_started + min(_QUEUE_MAX_WAIT, float(req.timeout_seconds))
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-            if _try_acquire_slot():
-                got_slot = True
-                break
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+                if _try_acquire_slot():
+                    got_slot = True
+                    break
+        finally:
+            _queue_leave(queue_key)
+        if not got_slot:
+            _bump("queue_timeout")
     queue_wait = time.monotonic() - queue_started
     if not got_slot:
         _bump("rejected_busy")
@@ -1401,6 +1500,8 @@ async def run(req: RunRequest, request: Request = None):
                 timeout_seconds=req.timeout_seconds,
                 started_at=started_wall,
                 started_monotonic=started_monotonic,
+                args_len=len(req.args or ""),
+                args_sha=args_sha,
             )
             task_manager[task_id] = handle
             handle.slot_held = True
@@ -1597,28 +1698,10 @@ async def run(req: RunRequest, request: Request = None):
 
     except HTTPException:
         raise
-    except BaseException as exc:
-        # 修复 P1-2：请求任务被取消/进程中断（CancelledError/KeyboardInterrupt/SystemExit 等）
-        # 不会进入下面的 except Exception；原实现直接走 finally：不杀子进程还删台账 → 永久孤儿。
-        # 这里先杀进程树，成功才允许 finally 删台账；失败则保留台账与并发槽。
-        logger.warning("任务 %s 被中断（%s），正在终止子进程树", task_id, type(exc).__name__)
-        kill_ok = True
-        if handle is not None and handle.process is not None and handle.process.returncode is None:
-            try:
-                kill_ok = await _kill_process_tree(handle.process)
-            except BaseException:
-                kill_ok = False
-        if handle is not None and not kill_ok:
-            handle.kill_failed = True
-            keep_handle = True
-            _bump("kill_failed")
-            logger.error("任务 %s 中断清理失败：进程可能仍在运行，已保留台账与并发槽", task_id)
-        for _task in list(locals().get("readers") or []) + [locals().get("wait_task")]:
-            if _task is not None and not _task.done():
-                _task.cancel()
-        _audit("run.abort", run_id=task_id, phase="interrupted", error=type(exc).__name__)
-        raise
-    except Exception:
+    except Exception as exc:
+        # 3.3.1 修复：异常处理顺序必须 Exception 先于 BaseException。
+        # 之前 BaseException 写在前面，导致下面的 except Exception 永远不可达：
+        # 服务端内部异常会冒到 uvicorn（裸 500、无 code/exit_code、spawn_errors 不计数）。
         _bump("spawn_errors")
         logger.error("任务 %s 异常: %s", task_id, traceback.format_exc())
         if handle is not None and handle.process is not None and handle.process.returncode is None:
@@ -1642,8 +1725,30 @@ async def run(req: RunRequest, request: Request = None):
             duration_seconds=round(time.monotonic() - started_monotonic, 3),
         )
         _audit_finish(response, client=client_ip, script=script_path.name, script_sha=script_sha,
-                      args_sha=args_sha, error="exception")
+                      args_sha=args_sha, error=type(exc).__name__)
         return response
+    except BaseException as exc:
+        # 修复 P1-2：请求任务被取消/进程中断（CancelledError/KeyboardInterrupt/SystemExit 等）
+        # 不会进入下面的 except Exception；原实现直接走 finally：不杀子进程还删台账 → 永久孤儿。
+        # 这里先杀进程树，成功才允许 finally 删台账；失败则保留台账与并发槽。
+        logger.warning("任务 %s 被中断（%s），正在终止子进程树", task_id, type(exc).__name__)
+        kill_ok = True
+        if handle is not None and handle.process is not None and handle.process.returncode is None:
+            try:
+                kill_ok = await _kill_process_tree(handle.process)
+            except BaseException:
+                kill_ok = False
+        if handle is not None and not kill_ok:
+            handle.kill_failed = True
+            keep_handle = True
+            _bump("kill_failed")
+            logger.error("任务 %s 中断清理失败：进程可能仍在运行，已保留台账与并发槽", task_id)
+        for _task in list(locals().get("readers") or []) + [locals().get("wait_task")]:
+            if _task is not None and not _task.done():
+                _task.cancel()
+        _audit("run.abort", run_id=task_id, phase="interrupted", error=type(exc).__name__,
+               code=500, exit_code=-1)
+        raise
     finally:
         if handle is not None:
             # 进程确认终止（或本来就没起来）才算 done；kill 失败时保持“运行中”，
@@ -1715,6 +1820,12 @@ async def list_tasks():
         "count": len(running),
         "tasks": running,
         "concurrency_limit": _MAX_CONCURRENCY,
+        "queue": {
+            "depth": _queue_depth(),
+            "limit": _QUEUE_MAX_DEPTH,
+            "max_wait_seconds": _QUEUE_MAX_WAIT,
+            "waiting": _queue_snapshot(),
+        },
         "counters": dict(_METRICS),
     }
 

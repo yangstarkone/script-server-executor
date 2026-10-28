@@ -1,6 +1,6 @@
 # script-server（脚本执行器）新设备安装与使用说明
 
-> **适用版本**：`script_server.py` VERSION = **3.3.0**（单文件 FastAPI）
+> **适用版本**：`script_server.py` VERSION = **3.3.1**（单文件 FastAPI）
 > **适用对象**：在一台全新 Windows 机器上安装、启动、接入平台的运维/实施工程师
 > **托管方式**：Windows 计划任务直接运行 `deploy\serve.py`，另有 1 分钟 watchdog 兜底（只依赖 Python）
 > **文档日期**：2026-10-27（按新托管方式重写）
@@ -347,7 +347,7 @@ cd C:\ScriptServer\script-server
 python .\deploy\serve.py --host 127.0.0.1 --port 9000
 ```
 
-看到 `[serve] start pid=... version=3.3.0 ...` 与 `Uvicorn running on http://127.0.0.1:9000` 即成功；
+看到 `[serve] start pid=... version=3.3.1 ...` 与 `Uvicorn running on http://127.0.0.1:9000` 即成功；
 另开窗口验证后 `Ctrl+C` 停止。前台方式日志只在控制台，生产不要这么跑。
 
 **方式 B：计划任务（生产标准做法）**
@@ -497,7 +497,7 @@ Start-Process powershell.exe -Verb RunAs -ArgumentList @(
 | # | 检查 | 命令 | 通过判据 | 失败先查 |
 |---|---|---|---|---|
 | 1 | 端口监听 | `netstat -ano \| findstr :9000` | 有 `LISTENING` | 进程没起 / 端口被占（`WinError 10048`）→ `ops-http.ps1 logs` |
-| 2 | 公开探活 | `curl.exe -s http://127.0.0.1:9000/health` | 200，`version=3.3.0`，`auth_required=true`，`draining=false` | 仍是 `auth_required=false` → `.env` 未生效；版本不是 3.3.0 → 跑了旧代码 |
+| 2 | 公开探活 | `curl.exe -s http://127.0.0.1:9000/health` | 200，`version=3.3.1`，`auth_required=true`，`draining=false` | 仍是 `auth_required=false` → `.env` 未生效；版本不是 3.3.1 → 跑了旧代码 |
 | 3 | 无 token 拒绝 | `curl.exe -s -o NUL -w "%{http_code}" http://127.0.0.1:9000/health/ready` | `401` | 返回 200 → token 没配（危险） |
 | 4 | 带 token 就绪 | `curl.exe -s -H "X-Script-Token: $t" http://127.0.0.1:9000/health/ready` | `status=ok`，`checks.state_dir.enabled=true`，`checks.python.exists=true` | `degraded` → 看 `checks` 哪个 `false` |
 | 5 | Bearer 兼容 | `-H "Authorization: Bearer $t"` 调 `/health/ready` | 200 | — |
@@ -587,12 +587,14 @@ Authorization: Bearer <WF_SCRIPT_TOKEN>
 `/health` 示例：
 
 ```json
-{"status":"ok","version":"3.2.0","auth_required":true,"draining":false,
- "running_tasks":0,"uptime_seconds":9.7,"counters":{"requests":0,"spawned":0,"run_success":0}}
+{"status":"ok","version":"3.3.1","auth_required":true,"draining":false,
+ "running_tasks":0,"queue":{"depth":0,"limit":16},"uptime_seconds":9.7,
+ "counters":{"requests":0,"spawned":0,"run_success":0}}
 ```
 
-> 上例 `counters` 为**节选**，实际有 17 个计数键（含 `spawn_errors`、`kill_failed`、`rejected_busy`、
-> `conflict_409`、`deduplicated`、`orphans_killed_at_startup` 等），排障时看它们更直接。
+> 上例 `counters` 为**节选**，实际有 22 个计数键（含 `spawn_errors`、`kill_failed`、`rejected_busy`、
+> `queued`、`queue_timeout`、`queue_full_rejected`、`conflict_409`、`deduplicated`、
+> `auth_failed`、`path_denied`、`orphans_killed_at_startup` 等），排障时看它们更直接。
 
 `/health/ready` 判读规则：
 
@@ -615,7 +617,7 @@ HTTP 401                                          → token 不一致（最常�
 | `env` | object | 否 | `{}` | 追加/覆盖环境变量（值必须字符串）；危险键（`PYTHONPATH`/`PATH`/`WF_SCRIPT_*` 等）→ 400；超过 65536 个字符 → 413 |
 | `timeout_seconds` | int | 否 | 300 | 1–7200；越界 → 422 |
 | `task_run_id` | string | 否 | 自动生成 | 幂等键 + 取消键；建议直接用平台 TaskRun id |
-| `block_strategy` | string | 否 | `reject` | 并发满时的策略：`reject` = 立即 429（带 `Retry-After`）；`queue` = 排队等空槽（最多 `WF_QUEUE_MAX_WAIT_SECONDS`=30s 或本次 `timeout_seconds`，取小） |
+| `block_strategy` | string | 否 | `reject` | 并发满时的策略：`reject` = 立即 429（带 `Retry-After`）；`queue` = 排队等空槽（最多 `WF_QUEUE_MAX_WAIT_SECONDS`=30s 或本次 `timeout_seconds`，取小；排队上限 `WF_QUEUE_MAX_DEPTH`=16，满了立即 429） |
 
 #### 调用示例
 
@@ -709,14 +711,14 @@ print(data["stdout"])
 | 码 | 场景 | 调用方处理 |
 |---|---|---|
 | **200** | 脚本执行完成（**含失败/超时/取消**，看 `exit_code`/`status_label`） | 按 `exit_code` 判定业务结果 |
-| 400 | 路径无效/不存在/不是文件、args 引号未闭合、env 键非法 | 修正参数，不要重试 |
+| 400 | 路径无效/不存在/不是文件、args 引号未闭合或含 NUL、env 键非法或值含 NUL | 修正参数，不要重试 |
 | 401 | token 缺失/错误 | 检查 token，不要重试 |
 | 403 | 路径在允许目录外、扩展名不允许 | 修正路径/配置，不要重试 |
 | 409 | 同 `task_run_id` 仍在运行（含"刚退出还没收尾"的窗口） | 响应带 `Retry-After: 5`；等几秒后查 `/tasks`，确认是"上次响应丢了"还是平台超时判失败 |
 | 413 | `args` 或 `env` 超过 65536 个字符 | 减少参数 |
 | 422 | 请求体不合法（timeout 越界、类型错、JSON 错） | 修正请求 |
 | 429 | 并发已满（默认 4），响应带 `Retry-After: 5` | 退避重试，或改传 `"block_strategy":"queue"` 让执行器排队 |
-| 500 | 服务端自身异常（典型：`/cancel` 杀进程树失败，可重试）；注意 `/run` 的**服务端内部异常仍返回 200 + `exit_code=3`**，不要只看 HTTP 码 | 看日志与 `counters.kill_failed` |
+| 500 | 只用于 `/cancel` 杀进程树失败等 HTTP 层异常；**`/run` 的服务端内部异常返回 200 + `code=500` + `exit_code=3`**（3.3.1 起稳定），不要只看 HTTP 码 | 看 `counters.spawn_errors` / `counters.kill_failed` 与 error.log |
 | 503 | 排空模式（调过 `/drain`） | 等待重启恢复；响应带 `Retry-After: 10` |
 
 #### 退出码语义（平台按它判定，务必读懂）
@@ -757,7 +759,8 @@ curl.exe -s -H "X-Script-Token: $t" http://127.0.0.1:9000/tasks
 ```
 
 返回 `count`、`tasks[]`（`task_id/pid/script/elapsed_seconds/timeout_seconds/cancelling`）、
-`concurrency_limit`；内存台账，**重启即清空**。`elapsed_seconds` 远超 `timeout_seconds` 说明卡死，按 pid 排查或取消。
+`concurrency_limit`，以及 `queue{depth,limit,max_wait_seconds,waiting[]}`（排队中的请求，3.3.1 起可见）；
+内存台账，**重启即清空**。`elapsed_seconds` 远超 `timeout_seconds` 说明卡死，按 pid 排查或取消。
 
 **`POST /cancel/{task_id}`**：
 
@@ -767,7 +770,7 @@ curl.exe -s -X POST -H "X-Script-Token: $t" "http://127.0.0.1:9000/cancel/manual
 
 - 200 `{"status":"cancelled"}`：已杀进程树并确认退出；
 - 200 `{"status":"cancelling"}`：还在 spawn 阶段，已登记取消；
-- 404 = 任务不存在；400 = 已完成；500 = 终止失败（可重试）。
+- 404 = 任务不存在（已完成任务通常也已从台账移除，同样返回 404）；400 = 已完成但仍在收尾窗口；500 = 终止失败（可重试）。
 
 **`POST /drain`（升级/重启前排空）**：
 
@@ -971,6 +974,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ops logs      # 服务日�
 | `WF_SCAN_ALLOWED_ROOTS` | 空（仅 `WF_SCRIPTS_DIR`） | `/scan` 允许的根（分号分隔） | 按需 |
 | `WF_ALLOWED_SCRIPT_EXTENSIONS` | `.py,.pyw` | 允许执行的扩展名（逗号分隔） | 一般不改 |
 | `WF_MAX_CONCURRENCY` | 4 | 同时执行脚本数上限，超出 429 | 按 CPU/内存调 |
+| `WF_QUEUE_MAX_WAIT_SECONDS` | 30 | `block_strategy=queue` 最长排队秒数（同时不超过本次 timeout） | 平台 HTTP 超时须大于“排队+执行” |
+| `WF_QUEUE_MAX_DEPTH` | 16 | 排队请求上限，满了立即 429（0=不限制） | 一般 16；长任务多可调大 |
 | `WF_MAX_OUTPUT_BYTES` | 8388608（8MB） | 单流输出捕获上限，超出截断 | 大输出脚本可调大 |
 | `WF_RESULT_CACHE_TTL` | 86400（24h） | 成功结果缓存保留秒数 | 热修频繁时调小 |
 | `WF_RESULT_CACHE_MAX_FILES` | 2000 | 缓存文件数上限 | 按磁盘调 |
@@ -1091,5 +1096,20 @@ Get-ScheduledTask -TaskName 'WorkflowPlatform-ScriptServer-Watchdog' | Format-Li
 
 ---
 
-本文依据 `script_server.py` 3.3.0、`deploy\serve.py`、`.env.example`、`deploy\*` 脚本与 192.168.1.210 的实测记录编写。
+## 附录 F：3.3.1（2026-10-28）变更——P1 修复
+
+| # | 变更 | 影响 |
+|---|---|---|
+| 1 | 修 `except` 顺序：服务端内部异常不再冒成裸 500 | 返回 HTTP 200 + `code=500` + `exit_code=3`；`counters.spawn_errors` 正常计数；审计有 `run.finish` |
+| 2 | `env` 值 / `args` 含 NUL 直接 400 | 不再触发 `CreateProcess` 异常 |
+| 3 | queue 可观测 + 有界 | `/tasks` 的 `queue{depth,limit,waiting}`、`/health` 的 `queue`；`WF_QUEUE_MAX_DEPTH`（默认 16）满了 429 + `Retry-After: 5`；新增 `queue_timeout` / `queue_full_rejected` |
+| 4 | `running.json` 不再落完整 argv | 只存 `args_len` / `args_sha`，`cmd` 字段移除 |
+| 5 | 审计补 `auth.fail` / `path.deny`，审计行改纯 JSON | 鉴权失败/越权可追溯；`jq` 可直接解析；新增 `auth_failed` / `path_denied` 计数 |
+| 6 | `verify-10.ps1` 版本号改为从 `script_server.py` 读取 | 以后升级不用改验收脚本 |
+
+验收：`verify-10.ps1` 10/10、`verify-hardening.py` 11/11、`verify-logging.py` 17/17、`verify-p1.py`（新增）全部 PASS。
+
+---
+
+本文依据 `script_server.py` 3.3.1、`deploy\serve.py`、`.env.example`、`deploy\*` 脚本与 192.168.1.210 的实测记录编写。
 托管方式、开机自启、watchdog 恢复与平台端到端链路在该机已实测；新设备仍请按第 3 章验收。

@@ -73,10 +73,22 @@ def write_script(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
 
 
+def _expected_version() -> str:
+    """从 script_server.py 读 VERSION，避免验收脚本写死版本号。"""
+    try:
+        import re
+        text = (ROOT / "script_server.py").read_text(encoding="utf-8")
+        m = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.M)
+        return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
 def test_version() -> None:
+    expected = _expected_version()
     status, _h, payload = api("GET", "/health", timeout=10)
-    check("/health 200 且版本 3.3.0", status == 200 and payload.get("version") == "3.3.0",
-          f"HTTP {status} version={payload.get('version')}")
+    check(f"/health 200 且版本 {expected}", status == 200 and payload.get("version") == expected,
+          f"HTTP {status} version={payload.get('version')} expected={expected}")
 
 
 def test_code_and_dedupe() -> tuple[bool, float]:

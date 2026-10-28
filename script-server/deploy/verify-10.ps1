@@ -19,6 +19,12 @@ foreach ($line in Get-Content -LiteralPath "$root\.env" -Encoding UTF8) {
 if (-not $token) { Write-Host '[FATAL] no WF_SCRIPT_TOKEN in .env'; exit 1 }
 if (-not $scriptsDir) { $scriptsDir = Join-Path (Split-Path -Parent $root) 'scripts' }
 
+# expected version is read from script_server.py, so this check survives future upgrades
+$expected = ''
+$verLine = Select-String -LiteralPath "$root\script_server.py" -Pattern '^VERSION\s*=\s*"([^"]+)"' -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($verLine) { $expected = $verLine.Matches[0].Groups[1].Value }
+
 $hdr = @{ 'X-Script-Token' = $token }
 $result = [ordered]@{}
 function Line($n, $ok, $detail) {
@@ -38,8 +44,8 @@ Line 1 ([bool]$listen) ("LISTENING pid=" + (($listen | Select-Object -ExpandProp
 try {
     $r = Invoke-WebRequest -UseBasicParsing -Uri "$base/health" -TimeoutSec 10
     $j = Decode $r | ConvertFrom-Json
-    $ok = ($r.StatusCode -eq 200 -and $j.version -eq '3.3.0' -and $j.auth_required -eq $true -and $j.draining -eq $false)
-    Line 2 $ok ("HTTP " + $r.StatusCode + " version=" + $j.version + " auth_required=" + $j.auth_required + " draining=" + $j.draining)
+    $ok = ($r.StatusCode -eq 200 -and $j.version -eq $expected -and $j.auth_required -eq $true -and $j.draining -eq $false)
+    Line 2 $ok ("HTTP " + $r.StatusCode + " version=" + $j.version + " expected=" + $expected + " auth_required=" + $j.auth_required + " draining=" + $j.draining)
 } catch { Line 2 $false $_.Exception.Message }
 
 # 3 without token -> 401
