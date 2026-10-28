@@ -30,7 +30,7 @@
 | **watchdog（随 `deploy\` 提供）** | **必须**（生产） | 进程意外退出后 1 分钟内自动拉起；`deploy\install-watchdog.ps1` 注册 | 无需下载 |
 | 浏览器 / Redis / PostgreSQL / Docker / WSL | **不需要** | — | — |
 
-> 交付目录里若出现 `jinteng\`（独立的凭据工具，约 18MB，与本系统无集成），**不要拷到新设备、也不要启动它**。
+> 交付目录里若出现 `credential-tool\`（独立的凭据工具，约 18MB，与本系统无集成），**不要拷到新设备、也不要启动它**。
 
 ### 0.3 最短路径（熟悉命令行的人照抄即可）
 
@@ -77,7 +77,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\verify-10.ps1
 
 - 代码与配置事实（版本、环境变量、接口字段、状态码、退出码语义、默认值）来自 **3.2.0 源码逐行核对**；
 - 安装/运行经验来自本仓库的实测记录（`notes/02-install-verify.md`）与评审文档；
-- 托管方式（计划任务 + `serve.py` + watchdog）与开机自启已在 192.168.1.210 实测（2026-10-27）：10/10 验收、强杀后 37–56 秒恢复、平台设备探活回到 `ok`；新设备仍请按第 3 章逐条复核。
+- 托管方式（计划任务 + `serve.py` + watchdog）与开机自启已在 192.0.2.10 实测（2026-10-27）：10/10 验收、强杀后 37–56 秒恢复、平台设备探活回到 `ok`；新设备仍请按第 3 章逐条复核。
 
 ### 0.6 交给自动化 / Agent 执行时的约定
 
@@ -223,7 +223,7 @@ Copy-Item "$src\INSTALL.md", "$src\MAINTENANCE.md" -Destination $dst -Force
 > `autostart-logon.ps1` 必须带：平台自带的 `start-platform.bat` 第 6 步会调用它来“确保执行器任务在跑”。
 > `logs\` 不用拷，`serve.py` 首次启动会自动创建。
 
-**不要拷**：`jinteng\`（与本系统无关的独立凭据工具）、`.deploy-backup-*\`（旧版本备份）、`.script_server_state\`（运行数据）、
+**不要拷**：`credential-tool\`（与本系统无关的独立凭据工具）、`.deploy-backup-*\`（旧版本备份）、`.script_server_state\`（运行数据）、
 `logs\`、`__pycache__\`、`verify\`、`notes\`、`tests\`、`tools\`；`start.bat` 与 `run_server.py` 仅开发/排障用，生产可不拷。
 
 > 包根目录的 `install.bat` 是 §2.5 方式 B 的一键版（自动提权 → 注册任务 → 启动 → 打印状态），
@@ -323,9 +323,9 @@ WF_MAX_CONCURRENCY=4
 # WF_RESULT_CACHE_TTL=86400
 ```
 
-> **本环境（工作流平台）特有的绝对路径**：平台的 http 任务用的是绝对路径 `E:\workflow-scripts-center\...`。
+> **本环境（工作流平台）特有的绝对路径**：平台的 http 任务用的是绝对路径 `D:\workflow-scripts\...`。
 > 新机器必须把该目录一起带过去（或把任务配置改成新路径），并在 `.env` 里加：
-> `WF_ALLOWED_SCRIPT_ROOTS=E:\workflow-scripts-center`（多个根用分号分隔）。
+> `WF_ALLOWED_SCRIPT_ROOTS=D:\workflow-scripts`（多个根用分号分隔）。
 > 不加这一行，这些任务会返回 403「路径不在允许的目录内」。
 
 **`.env` 到底怎么生效（必须先理解）**：
@@ -417,7 +417,7 @@ print("end", flush=True)
 ```powershell
 Remove-NetFirewallRule -DisplayName "script-server 9000" -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName "script-server 9000" -Direction Inbound -Protocol TCP `
-  -LocalPort 9000 -RemoteAddress 192.168.1.10 -Action Allow
+  -LocalPort 9000 -RemoteAddress 192.0.2.20 -Action Allow
 ```
 
 在平台机器上验证连通：
@@ -809,15 +809,15 @@ curl.exe -s -X POST -H "X-Script-Token: $t" "http://127.0.0.1:9000/drain?timeout
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `name` | 是 | 业务唯一名（任务里 `config.device` 用它） |
-| `base_url` | 是 | **平台/Worker 视角**可达地址，如 `http://192.168.1.11:9000`（去尾斜杠） |
+| `base_url` | 是 | **平台/Worker 视角**可达地址，如 `http://192.0.2.10:9000`（去尾斜杠） |
 | `token` | 生产必填 | 与执行机 `WF_SCRIPT_TOKEN` **逐字符一致** |
 | `is_active` | — | 停用后任务在分发阶段失败 |
 
 ```powershell
 # 平台 API 登记（需平台登录 JWT；示例）
-$plat = 'http://192.168.1.10:8000'
+$plat = 'http://192.0.2.20:8000'
 $jwt  = '<平台 JWT>'
-$body = @{ name='采集机1'; base_url='http://192.168.1.11:9000'; token='<执行机token>' } | ConvertTo-Json
+$body = @{ name='采集机1'; base_url='http://192.0.2.10:9000'; token='<执行机token>' } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri "$plat/api/v1/devices" `
   -Headers @{ Authorization = "Bearer $jwt" } -ContentType 'application/json' -Body $body
 
@@ -1059,7 +1059,7 @@ Get-ScheduledTask -TaskName 'WorkflowPlatform-ScriptServer-Watchdog' | Format-Li
 | `INSTALL.md`、`MAINTENANCE.md` | 参考 | 本文与运维手册 |
 | `start.bat`、`run_server.py` | 仅开发排障 | `start.bat` 会无差别杀 9000 端口进程 |
 | `tests\`、`tools\`、`notes\`、`verify\`、`__pycache__\`、`.deploy-backup-*\` | **不要拷** | 开发/验证产物 |
-| `jinteng\` | **不要拷** | 与本系统无关的独立凭据工具（约 18MB，本机在 `Documents\jinteng`） |
+| `credential-tool\` | **不要拷** | 与本系统无关的独立凭据工具（约 18MB，本机在 `Documents\credential-tool`） |
 
 ### C.2 两种布局的路径对照（避免"改了不生效"）
 
@@ -1142,5 +1142,5 @@ Get-ScheduledTask -TaskName 'WorkflowPlatform-ScriptServer-Watchdog' | Format-Li
 
 ---
 
-本文依据 `script_server.py` 3.3.2、`deploy\serve.py`、`.env.example`、`deploy\*` 脚本与 192.168.1.210 的实测记录编写。
+本文依据 `script_server.py` 3.3.2、`deploy\serve.py`、`.env.example`、`deploy\*` 脚本与 192.0.2.10 的实测记录编写。
 托管方式、开机自启、watchdog 恢复与平台端到端链路在该机已实测；新设备仍请按第 3 章验收。

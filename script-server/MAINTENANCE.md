@@ -2,7 +2,7 @@
 
 > 适用版本：`script_server.py` **3.3.2**；托管方式：**Windows 计划任务直接运行 `deploy\serve.py` + 1 分钟 watchdog**。
 > 安装/首次验收见 [`INSTALL.md`](INSTALL.md)。
-> 本文“实测”均指 2026-10-27 在 192.168.1.210（SERVICE）上的实际结果。
+> 本文“实测”均指 2026-10-27 在 192.0.2.10（EXECUTOR-HOST）上的实际结果。
 
 ## 0. 架构一页
 
@@ -28,7 +28,7 @@ Windows Task Scheduler
 | 根目录 | `C:\ScriptServer\script-server` |
 | 启动器 | `deploy\serve.py` |
 | 配置 | `.env`（token / 脚本目录 / 状态目录 / 并发） |
-| 业务脚本 | `C:\ScriptServer\scripts`，额外允许根 `E:\workflow-scripts-center` |
+| 业务脚本 | `C:\ScriptServer\scripts`，额外允许根 `D:\workflow-scripts` |
 | 状态目录 | `C:\ScriptServer\.script_server_state`（缓存 + running.json） |
 | 服务日志 | `logs\script-server-out.log`（业务 INFO+）、`logs\script-server-error.log`（仅 ERROR+）、`logs\script-server-access.log`（每请求一行）、`logs\script-server-audit.log`（审计，每行纯 JSON）；均在本地按天轮转，保留 14 天 |
 | 看护日志 | `logs\watchdog.log` |

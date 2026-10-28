@@ -1,7 +1,7 @@
 # 脚本执行器（script-server 3.2.0）测评报告
 
 > 测评对象：`C:\ScriptServer\script-server\script_server.py`（1584 行）+ `deploy\serve.py` + 计划任务托管
-> 时间：2026-10-27 18:20~18:40 · 主机 `YANGSTARONE` / 16 逻辑核 / Python 3.12.10
+> 时间：2026-10-27 18:20~18:40 · 主机 `EXECUTOR-HOST` / 16 逻辑核 / Python 3.12.10
 > 方法：**代码走读**（全文）+ **黑盒探针 30 项**（真实 HTTP 调用，不 mock）+ **文档核对**
 > 探针脚本与原始结果：`C:\ScriptServer\logs\eval-probe{,2,3}.py`、`eval-extra{,3}.json`（`logs/` 已 gitignore）
 > 说明：本文所有“实测”均为本轮真实执行的结果；“代码事实”为读源码得出、未构造场景实测的结论。
@@ -93,7 +93,7 @@
 
 ### P0-1 凭证等于管理员级 RCE，且链路明文（安全）
 
-- 事实：`.env` 里 `WF_SCRIPT_TOKEN` 明文；`/run` 只校验 token，不校验“谁在调”（无调用者标识/审计）；监听 `0.0.0.0:9000` 无 TLS；计划任务以 **Administrator + RunLevel=Highest** 运行，业务脚本继承该身份；`WF_ALLOWED_SCRIPT_ROOTS=E:\workflow-scripts-center`（约 1.7 万文件）全部可在白名单内执行。
+- 事实：`.env` 里 `WF_SCRIPT_TOKEN` 明文；`/run` 只校验 token，不校验“谁在调”（无调用者标识/审计）；监听 `0.0.0.0:9000` 无 TLS；计划任务以 **Administrator + RunLevel=Highest** 运行，业务脚本继承该身份；`WF_ALLOWED_SCRIPT_ROOTS=D:\workflow-scripts`（约 1.7 万文件）全部可在白名单内执行。
 - 影响：token 一旦泄漏（平台数据库、截图、日志转发、内网嗅探），攻击者即获得**该主机管理员级任意 Python 执行**，无需再提权。执行器自身的输入防护（路径/env）在此前提下形同虚设——因为 token 持有者本来就被授权执行任意白名单内脚本。
 - 建议（按性价比）：① 专用**低权限服务账户**跑计划任务 + 脚本目录 ACL（执行器只读、状态目录可写）；② 平台→执行器走内网隔离或反向代理 + IP 白名单；③ token 定期轮换并在平台侧同步；④ 日志加调用方标识（平台可在 header 传 `X-Caller`，执行器记入日志/结果），否则出事后无法定位是谁派的活。
 
@@ -128,7 +128,7 @@
 ### P1-5 文档与现架构漂移 ✅ 2026-10-28 已修复
 
 - 事实（改造前）：`deploy\INSTALL-EXECUTOR.md` §0 仍写“Node.js 18+ + 进程守护组件 **必须**（生产）”，§4 全是旧守护命令；
-  `deploy\OPERATIONS-executor.md` 全篇旧守护托管，且路径还是旧机 `C:\Users\yang\Documents\workflow-platform-20261022`；
+  `deploy\OPERATIONS-executor.md` 全篇旧守护托管，且路径还是旧机 `C:\Users\<account>\Documents\workflow-platform-20261022`；
   两份文档引用的 `EXECUTOR-STABILITY-EVAL-20261023.md`、`FIX-P1-20261026.md` 不在仓库（悬空引用）。
 - 影响：新设备照此安装会**重新引入旧守护组件**，与本机现状（计划任务 + `serve.py`）相反；排障手册的路径/命令全部失效。
 - **修复（2026-10-28）**：`INSTALL-EXECUTOR.md` 按现架构重写（只要 Python、`install.bat`、计划任务 + watchdog、
@@ -196,7 +196,7 @@
 ## 8. 未验证项
 
 - 真实重启后的开机自启（未重启本机；`Stop/Start` 冷启动等价测试此前通过）。
-- 平台「设备管理」登记与「检测」在线（需平台侧操作，`base_url=http://192.168.1.220:9000` + `.env` token）。
+- 平台「设备管理」登记与「检测」在线（需平台侧操作，`base_url=http://192.0.2.10:9000` + `.env` token）。
 - `kill_failed` 场景（需构造不可杀进程）、断电/网络中断、长时间运行的内存/句柄趋势。
 - 磁盘写满时状态目录降级路径（代码有降级分支，未构造）。
 

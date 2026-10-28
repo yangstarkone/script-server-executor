@@ -11,17 +11,17 @@
 
 | 设备 | 地址 | 账户 | 状态 | 说明 |
 |---|---|---|---|---|
-| `YANGSTARONE` | 192.168.1.220 | `YANGSTARONE\Administrator` | **在用**（生产执行机） | 平台 backend 在 192.168.1.210 |
-| `WUYUAN` | 192.168.1.222 | `WUYUAN\Administrator` | 已停用 | 旧执行机，本机目录由其整体拷贝而来 |
+| `EXECUTOR-HOST` | 192.0.2.10 | `EXECUTOR-HOST\Administrator` | **在用**（生产执行机） | 平台 backend 在 192.0.2.10 |
+| `OLD-EXECUTOR-HOST` | 192.0.2.30 | `OLD-EXECUTOR-HOST\Administrator` | 已停用 | 旧执行机，本机目录由其整体拷贝而来 |
 
-## 2. YANGSTARONE 安装记录（2026-10-26 ~ 2026-10-28）
+## 2. EXECUTOR-HOST 安装记录（2026-10-26 ~ 2026-10-28）
 
 ### 2.1 环境（实测）
 
 | 组件 | 版本/路径 |
 |---|---|
 | OS | Windows 10.0.26100（16 逻辑核） |
-| Python | 3.12.10 · `C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe` |
+| Python | 3.12.10 · `C:\Users\<account>\AppData\Local\Programs\Python\Python312\python.exe` |
 | 依赖 | fastapi 0.119.1 / uvicorn 0.49.0 / pydantic 2.13.4（满足 `requirements.txt`） |
 | 执行器 | `script_server.py` 3.3.0（2026-10-28 由 3.2.0 加固升级） |
 
@@ -35,7 +35,7 @@
    `task_run_id` 会命中旧机缓存而“假成功”）。
 2. 复制 `.env.example` → `.env`：`WF_SCRIPT_TOKEN`（48 hex，沿用旧机值）、`WF_SCRIPT_REQUIRE_TOKEN=1`、
    `WF_SCRIPTS_DIR=C:\ScriptServer\scripts`、`WF_SCRIPT_STATE_DIR=C:\ScriptServer\.script_server_state`、
-   `WF_ALLOWED_SCRIPT_ROOTS=E:\workflow-scripts-center`、`WF_MAX_CONCURRENCY=4`。
+   `WF_ALLOWED_SCRIPT_ROOTS=D:\workflow-scripts`、`WF_MAX_CONCURRENCY=4`。
 3. `python -m pip install -r requirements.txt`。
 4. **一键安装（2026-10-27 17:41）**：`install.bat -nopause`（自提权）→ `deploy\cutover-to-uvicorn-task.ps1`：
    结束旧任务实例 → 注册主任务 + watchdog → 启动。
@@ -70,9 +70,9 @@
 
 ### 2.5 平台侧（已生效）
 
-- 平台 backend（192.168.1.210）每 60 秒调用 `http://192.168.1.220:9000/health/ready`，返回 200；
+- 平台 backend（192.0.2.10）每 60 秒调用 `http://192.0.2.10:9000/health/ready`，返回 200；
   访问记录见 `logs\script-server-access.log`（改造前在 error.log 里）。
-- 设备登记：`base_url=http://192.168.1.220:9000`、`token` 与 `.env` 的 `WF_SCRIPT_TOKEN` 逐字符一致。
+- 设备登记：`base_url=http://192.0.2.10:9000`、`token` 与 `.env` 的 `WF_SCRIPT_TOKEN` 逐字符一致。
 - 改 token 不需要重启执行器（平台侧改完即生效）；执行器侧改 token 需 `env-change-restart.bat`。
 
 ### 2.6 防火墙（现状，仅记录）
@@ -82,7 +82,7 @@
 
 ```powershell
 New-NetFirewallRule -DisplayName "script-server 9000" -Direction Inbound -Protocol TCP `
-  -LocalPort 9000 -RemoteAddress 192.168.1.0/24 -Action Allow
+  -LocalPort 9000 -RemoteAddress 192.0.2.0/24 -Action Allow
 ```
 
 ### 2.7 本机的坑（实测证据）
@@ -119,7 +119,7 @@ New-NetFirewallRule -DisplayName "script-server 9000" -Direction Inbound -Protoc
   结果：10:32:27 `/health` 200 `version=3.3.0`（pid 17652），主任务 `State=Running`。
 - 验收：`verify-10.ps1` **10/10 PASS**；`verify-hardening.py` **11/11 PASS**（首跑/幂等/内容指纹/失败 500/超时 502/
   reject 429+Retry-After/queue 排队 4.9s/审计三类事件/不落明文参数）；`verify-logging.py` **17/17 PASS**。
-- 未验证：平台侧（192.168.1.210）尚未实测新的 `block_strategy=queue` 与 `code` 字段的消费逻辑（执行器侧已就绪）。
+- 未验证：平台侧（192.0.2.10）尚未实测新的 `block_strategy=queue` 与 `code` 字段的消费逻辑（执行器侧已就绪）。
 - 说明：失败/超时/取消**不写缓存**，所以平台「失败工作流里的重试」会真正重跑；幂等只防“已成功但响应丢失”的重投。
 
 ### 2.10 证据文件

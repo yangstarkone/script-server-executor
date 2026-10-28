@@ -13,3 +13,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# 脱敏精确映射表：含内网地址/主机名/账户名，只在各机器本地维护，绝不入库
+tools/sanitize.local.json
+.pytest_cache/

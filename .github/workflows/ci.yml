@@ -29,6 +29,9 @@ jobs:
       - name: byte-compile executor
         run: python -m py_compile script-server/script_server.py
 
+      - name: no internal identifiers (sanitize check)
+        run: python tools/sanitize.py --check
+
       - name: unit tests
         run: python -m pytest script-server/tests -q
 
