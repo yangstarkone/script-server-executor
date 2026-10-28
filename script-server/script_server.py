@@ -37,7 +37,8 @@
 请求 (POST /run):
   {
     "file_path": "task.py",           // 必填，绝对路径或相对路径
-    "args": "--verbose",              // 可选，CLI 参数（Windows 下按“空格/双引号”切分，反斜杠原样保留）
+    "args": "--verbose",              // 可选，CLI 参数（Windows 下按“空格/双引号”切分，反斜杠原样保留；
+                                      //       空引号 "" 会保留为空参数，不会被吞掉）
     "env": {"KEY": "value"},          // 可选，注入为环境变量
     "timeout_seconds": 300,           // 可选，默认 300，范围 1-7200
     "task_run_id": "xxx",             // 可选，幂等键 + 取消追踪
@@ -45,11 +46,17 @@
   }
 
 响应 (HTTP 200):
-  {task_id, code, exit_code, stdout, stderr, success, partial, status_label,
+  {task_id, code, exit_code, stdout, stderr, success, partial, status_label, error_kind,
    cancelled, timed_out, deduplicated, truncated, duration_seconds}
-  code 三态（平台判定用，与 exit_code 互补）:
-    200 = 成功；500 = 失败/取消/脚本内部错误；502 = 超时（进程已终止）
+  code（平台判定用，与 exit_code 互补）:
+    200 = 成功；206 = 部分成功（脚本 exit 1）；500 = 失败/取消/执行器内部错误；
+    502 = 超时（进程已终止）
+  error_kind（3.3.2 新增，最精确的一维分类，建议平台优先用它）:
+    ok / partial / script_error / timeout / cancelled / executor_error
+    其中 executor_error 表示执行器自身故障（spawn 失败、内部异常），与脚本自己失败区分开。
   HTTP 层错误仍用状态码: 400 参数、401 鉴权、403 路径、409 同 task_id 运行中、429 繁忙/排队已满、503 排空。
+  请求体字段严格校验（3.3.2）：常见错拼（timeout/timeout_ms/filepath/argv/task_id…）直接 400 并给出正确字段名；
+  其它未知字段默认告警并忽略，设 WF_STRICT_FIELDS=1 可改为 400（确认调用方无多余字段后开启）。
 
 取消 (POST /cancel/{task_id]):
   杀掉正在运行的脚本进程树（先 taskkill /F /T，失败再 kill 主进程）。
@@ -68,12 +75,18 @@
   WF_RESULT_CACHE_MAX_FILES=2000  结果缓存文件数上限
   WF_RESULT_CACHE_MAX_BYTES=536870912  结果缓存总字节上限（超出删最旧）
   WF_RESULT_CACHE_OUTPUT_CHARS=1000000  缓存里每条输出字符上限
+  WF_PARTIAL_CODE=206             脚本 exit 1（部分成功）返回的 code：206（默认）/ 500（回退旧行为）
+  WF_STRICT_FIELDS=0              /run 请求体里出现未知字段时：0=告警忽略，1=直接 400
+  WF_READY_PROBE_TTL_SECONDS=300  /health/ready 写探测文件的缓存秒数（0=每次都写，旧行为）
   WF_ALLOWED_SCRIPT_ROOTS=        【追加】绝对路径白名单根目录（分号分隔）。
                                   默认只允许 WF_SCRIPTS_DIR 内的绝对路径（fail-closed）；
                                   需要执行 scripts 目录之外的绝对路径时，必须显式把根目录列在这里。
   WF_ALLOWED_SCRIPT_EXTENSIONS=".py,.pyw"
   WF_SCAN_ALLOWED_ROOTS=          【追加】/scan 允许扫描的目录（分号分隔）。
                                   默认只允许 WF_SCRIPTS_DIR；空值不再表示"不限制"。
+  WF_SCAN_MAX_FILES=2000          /scan 单次返回文件数上限（超出置 truncated=true）
+  WF_SCAN_MAX_DEPTH=8             /scan 递归深度上限（相对请求目录）
+  WF_SCAN_ABSOLUTE_PATHS=0        /scan 默认返回相对路径（path 可直接回传 /run）；1=默认返回绝对路径
   WF_CANCEL_ON_DISCONNECT=1       客户端断开是否取消执行（默认 1）
   WF_SCRIPT_ENV_DENY="WF_SCRIPT_TOKEN"  不向业务脚本传递的服务级环境变量（逗号分隔）
   WF_SCRIPT_REQUIRE_TOKEN=0       为 1 时 token 为空直接拒绝启动
@@ -121,7 +134,7 @@ logger = logging.getLogger(__name__)
 # 业务审计（一次运行一行 JSON）：由 deploy\serve.py 挂到 logs\script-server-audit.log
 audit_logger = logging.getLogger("audit")
 
-VERSION = "3.3.1"
+VERSION = "3.3.2"
 
 
 def _audit(event: str, **fields) -> None:
@@ -301,6 +314,20 @@ _MAX_CONCURRENCY = max(1, _env_int("WF_MAX_CONCURRENCY", 4))
 _QUEUE_MAX_WAIT = max(1, _env_int("WF_QUEUE_MAX_WAIT_SECONDS", 30))
 # 排队上限：默认 16；0 = 不限制（不建议，排队请求会一直占着连接等空槽）。
 _QUEUE_MAX_DEPTH = max(0, _env_int("WF_QUEUE_MAX_DEPTH", 16))
+# 部分成功（脚本 exit 1）的 code：用 206 与“失败 500”区分（3.3.2 修 P2-3）。
+# 平台若仍按 code==500 判定失败，可设 WF_PARTIAL_CODE=500 回退旧行为，无需改代码。
+_PARTIAL_CODE = _env_int("WF_PARTIAL_CODE", 206)
+if _PARTIAL_CODE not in (200, 206, 500):
+    logger.warning("WF_PARTIAL_CODE=%s 不在 {200,206,500}，回退默认 206", _PARTIAL_CODE)
+    _PARTIAL_CODE = 206
+# 未知字段策略：0=告警忽略（兼容旧/新平台多传字段），1=400（P2-2，确认调用方后开启）
+_STRICT_FIELDS = _env_bool("WF_STRICT_FIELDS", False)
+# /health/ready 的写探测有成本（平台每 60s 轮询一次），结果按 TTL 缓存；0=每次都写
+_READY_PROBE_TTL = max(0, _env_int("WF_READY_PROBE_TTL_SECONDS", 300))
+# /scan 上限：文件数 / 递归深度 / 是否默认返回绝对路径
+_SCAN_MAX_FILES = max(1, _env_int("WF_SCAN_MAX_FILES", 2000))
+_SCAN_MAX_DEPTH = max(1, _env_int("WF_SCAN_MAX_DEPTH", 8))
+_SCAN_ABSOLUTE_PATHS = _env_bool("WF_SCAN_ABSOLUTE_PATHS", False)
 _MAX_OUTPUT_BYTES = max(64 * 1024, _env_int("WF_MAX_OUTPUT_BYTES", 8 * 1024 * 1024))
 _RESULT_CACHE_TTL = max(60, _env_int("WF_RESULT_CACHE_TTL", 24 * 3600))
 _RESULT_CACHE_MAX_FILES = max(10, _env_int("WF_RESULT_CACHE_MAX_FILES", 2000))
@@ -419,6 +446,7 @@ _METRICS = {
     "run_kill_failed": 0,
     "rejected_busy": 0,
     "queued": 0,
+    "queue_success": 0,
     "queue_timeout": 0,
     "queue_full_rejected": 0,
     "conflict_409": 0,
@@ -431,6 +459,8 @@ _METRICS = {
     "auth_failed": 0,
     "path_denied": 0,
     "drain_rejected": 0,
+    "unknown_fields": 0,
+    "invalid_fields": 0,
 }
 
 
@@ -542,6 +572,18 @@ def _queue_depth() -> int:
         return len(_queue_waiters)
 
 
+def _queue_is_head(key: Optional[str]) -> bool:
+    """只有队头才能抢空槽 → 严格 FIFO（3.3.2 修 P2-6）。
+
+    dict 保持插入顺序（CPython 3.7+），队头 = 最早登记的等待者。
+    """
+    if not key:
+        return True
+    with _queue_lock:
+        first = next(iter(_queue_waiters), None)
+    return first == key
+
+
 def _queue_snapshot() -> List[dict]:
     now = time.monotonic()
     with _queue_lock:
@@ -550,8 +592,9 @@ def _queue_snapshot() -> List[dict]:
                 "task_id": item["task_id"],
                 "script": item["script"],
                 "waited_seconds": round(now - item["since"], 1),
+                "position": index + 1,
             }
-            for item in _queue_waiters.values()
+            for index, item in enumerate(_queue_waiters.values())
         ]
 
 
@@ -746,15 +789,22 @@ async def _cache_put(task_id: str, response: dict, fingerprint: str) -> None:
         logger.warning("写结果缓存失败（task_id=%s）: %s", task_id, exc)
 
 
-def _file_signature(path: Path) -> dict:
-    """脚本内容指纹：脚本改过之后，同一 task_run_id 不能复用旧结果（修测评「幂等缓存陈旧」）。"""
+def _file_signature(path: Path, with_digest: bool = True) -> dict:
+    """脚本内容指纹：脚本改过之后，同一 task_run_id 不能复用旧结果（修测评「幂等缓存陈旧」）。
+
+    with_digest=False 时只 stat 不读文件（3.3.2 修 P2-7）：没传 task_run_id 的请求根本不做幂等，
+    没必要每次把整份脚本读一遍算 sha256。
+    """
     try:
         st = path.stat()
-        digest = hashlib.sha256()
-        with path.open("rb") as fh:
-            for chunk in iter(lambda: fh.read(256 * 1024), b""):
-                digest.update(chunk)
-        return {"sha256": digest.hexdigest(), "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+        sha = ""
+        if with_digest:
+            digest = hashlib.sha256()
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(256 * 1024), b""):
+                    digest.update(chunk)
+            sha = digest.hexdigest()
+        return {"sha256": sha, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
     except OSError as exc:
         logger.warning("计算脚本内容指纹失败（%s）: %s", path, exc)
         return {"sha256": "", "size": 0, "mtime_ns": 0}
@@ -779,7 +829,9 @@ def _request_fingerprint(req: "RunRequest", script_path: Path, script_sig: dict)
 # ── 模型 ────────────────────────────────────────────
 
 class RunRequest(BaseModel):
-    # 允许未知字段（旧/新平台可能多传），但不静默忽略：/run 里会打 WARNING 列出字段名
+    # 允许未知字段（旧/新平台可能多传），但绝不静默忽略（3.3.2 修 P2-2）：
+    #   - 常见错拼/近似字段名（timeout、filepath、argv…）→ 400 并提示正确字段；
+    #   - 其它未知字段 → WARNING + 审计记录 + 计数；WF_STRICT_FIELDS=1 时改为 400。
     model_config = ConfigDict(extra="allow")
 
     file_path: str
@@ -797,15 +849,43 @@ class RunRequest(BaseModel):
         return v
 
 
+# 常见错拼/近似字段 → 正确字段（3.3.2 P2-2）：这类错误过去被静默忽略，
+# 典型后果是 {"timeout": 1} 被忽略后按默认 300s 跑，平台以为 1s 就超时。
+_FIELD_ALIASES = {
+    "timeout": "timeout_seconds",
+    "timeout_sec": "timeout_seconds",
+    "timeout_seconds_": "timeout_seconds",
+    "timeout_ms": "timeout_seconds（本接口只接受秒，请换算）",
+    "file": "file_path",
+    "filepath": "file_path",
+    "filePath": "file_path",
+    "script": "file_path",
+    "script_path": "file_path",
+    "scriptPath": "file_path",
+    "path": "file_path",
+    "argv": "args",
+    "arguments": "args",
+    "command_args": "args",
+    "environment": "env",
+    "envs": "env",
+    "task_id": "task_run_id",
+    "run_id": "task_run_id",
+    "taskId": "task_run_id",
+    "block": "block_strategy",
+    "strategy": "block_strategy",
+}
+
+
 class RunResponse(BaseModel):
     task_id: str
-    code: int = 200          # 200 成功 / 500 失败 / 502 超时（平台判定用；与 exit_code 互补）
+    code: int = 200          # 200 成功 / 206 部分成功 / 500 失败或执行器错误 / 502 超时
     exit_code: int
     stdout: str
     stderr: str
     success: bool
     partial: bool = False
     status_label: str
+    error_kind: str = "ok"   # ok / partial / script_error / timeout / cancelled / executor_error
     cancelled: bool = False
     timed_out: bool = False
     deduplicated: bool = False
@@ -823,6 +903,7 @@ def _audit_finish(response: "RunResponse", **fields) -> None:
         status=response.status_label,
         success=response.success,
         partial=response.partial,
+        error_kind=response.error_kind,
         cancelled=response.cancelled,
         timed_out=response.timed_out,
         truncated=response.truncated,
@@ -832,6 +913,36 @@ def _audit_finish(response: "RunResponse", **fields) -> None:
 
 
 # ── 辅助 ────────────────────────────────────────────
+
+def _check_unknown_fields(req: "RunRequest", client_ip: str) -> List[str]:
+    """校验请求体里的未知字段（3.3.2 修 P2-2）。
+
+    返回仍旧被忽略的未知字段名（用于审计），并可能抛 400。
+    """
+    extra = sorted((req.model_extra or {}).keys())
+    if not extra:
+        return []
+    hints = {name: _FIELD_ALIASES[name] for name in extra if name in _FIELD_ALIASES}
+    if hints:
+        _bump("invalid_fields")
+        _audit("run.reject", reason="unknown_field", client=client_ip,
+               run_id=(req.task_run_id or "").strip(), fields=extra, hints=hints)
+        detail = "；".join(f"{k} → {v}" for k, v in hints.items())
+        raise HTTPException(
+            400,
+            f"请求字段无法识别（疑似写错）：{detail}。请改用上表右侧的字段名。",
+        )
+    if _STRICT_FIELDS:
+        _bump("invalid_fields")
+        _audit("run.reject", reason="unknown_field", client=client_ip,
+               run_id=(req.task_run_id or "").strip(), fields=extra, strict=True)
+        raise HTTPException(400, f"请求包含未知字段：{', '.join(extra)}（WF_STRICT_FIELDS=1）")
+    _bump("unknown_fields")
+    logger.warning(
+        "POST /run 收到未识别字段（已忽略）: %s；若本应是有效字段，请升级调用方"
+        "（设 WF_STRICT_FIELDS=1 可让未知字段直接 400）", ", ".join(extra),
+    )
+    return extra
 
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
@@ -1012,10 +1123,14 @@ def _split_args_windows(raw: str) -> List[str]:
 
     不能用 shlex.split(posix=True)：它会把 C:\\temp\\new 变成 C:tempnew。
     同时兼容旧 shlex 的单引号分组行为（复审 N7）。
+
+    3.3.2 修 P2-1：`a "" b` 必须得到 ['a', '', 'b']。旧实现只在 current 非空时入栈，
+    空引号产生的空 token 会被静默丢弃，导致脚本收到的 argv 少一位、后续参数整体错位。
     """
     args: List[str] = []
     current: List[str] = []
     quote: Optional[str] = None
+    started = False  # 当前 token 是否已经开始（含空引号，用于区分“空参数”与“没有参数”）
     for ch in raw:
         if quote is not None:
             if ch == quote:
@@ -1025,14 +1140,17 @@ def _split_args_windows(raw: str) -> List[str]:
             continue
         if ch in ("'", '"'):
             quote = ch
+            started = True
             continue
         if ch in " \t\r\n":
-            if current:
+            if started:
                 args.append("".join(current))
                 current = []
+                started = False
             continue
         current.append(ch)
-    if current:
+        started = True
+    if started:
         args.append("".join(current))
     if quote is not None:
         raise HTTPException(400, "args 解析失败：引号未闭合")
@@ -1248,6 +1366,32 @@ def _uptime_seconds() -> float:
 _STARTED_AT = time.time()
 
 
+# /health/ready 的写探测：平台每 60s 轮询一次，每次都写盘没有意义（3.3.2 修 P2-5）。
+# 结果按 WF_READY_PROBE_TTL_SECONDS 缓存；0 = 每次都写（旧行为）。
+_ready_probe_lock = threading.Lock()
+_ready_probe_cache: Dict[str, float] = {"ok": -1.0, "at": 0.0}
+
+
+def _scripts_writable() -> tuple[bool, bool]:
+    """返回 (scripts 目录可写, 是否命中缓存)。"""
+    now = time.monotonic()
+    with _ready_probe_lock:
+        cached = _ready_probe_cache["ok"]
+        if cached >= 0 and (now - _ready_probe_cache["at"]) < _READY_PROBE_TTL:
+            return cached > 0, True
+        ok = False
+        try:
+            probe = _SCRIPTS_DIR / f".write_probe_{os.getpid()}"
+            probe.write_text("x", encoding="utf-8")
+            probe.unlink()
+            ok = True
+        except OSError:
+            ok = False
+        _ready_probe_cache["ok"] = 1.0 if ok else 0.0
+        _ready_probe_cache["at"] = now
+        return ok, False
+
+
 @app.get("/health")
 async def health():
     """公开探活：只返回状态/版本/运行中数量/计数，不泄露内部路径。"""
@@ -1265,17 +1409,15 @@ async def health():
 
 @app.get("/health/ready", dependencies=[Depends(require_token)])
 async def health_ready():
-    """鉴权就绪检查：能执行脚本吗？（解释器/脚本目录/状态目录/缓存/排空）"""
+    """鉴权就绪检查：能执行脚本吗？（解释器/脚本目录/状态目录/缓存/排空）
+
+    scripts 目录可写性用一次性写探测，结果按 WF_READY_PROBE_TTL_SECONDS 缓存（3.3.2 修 P2-5）。
+    """
     scripts_ok = _SCRIPTS_DIR.is_dir()
     scripts_writable = False
+    writable_from_cache = False
     if scripts_ok:
-        try:
-            probe = _SCRIPTS_DIR / f".write_probe_{os.getpid()}"
-            probe.write_text("x", encoding="utf-8")
-            probe.unlink()
-            scripts_writable = True
-        except OSError:
-            scripts_writable = False
+        scripts_writable, writable_from_cache = _scripts_writable()
     python_ok = Path(sys.executable).exists()
     cache_files = 0
     if _STATE_OK:
@@ -1284,7 +1426,13 @@ async def health_ready():
         except OSError:
             pass
     checks = {
-        "scripts_dir": {"path": str(_SCRIPTS_DIR), "exists": scripts_ok, "writable": scripts_writable},
+        "scripts_dir": {
+            "path": str(_SCRIPTS_DIR),
+            "exists": scripts_ok,
+            "writable": scripts_writable,
+            "writable_from_cache": writable_from_cache,
+            "probe_ttl_seconds": _READY_PROBE_TTL,
+        },
         "state_dir": {"path": str(_STATE_DIR), "enabled": _STATE_OK},
         "python": {"path": sys.executable, "exists": python_ok},
         "result_cache_files": cache_files,
@@ -1333,11 +1481,48 @@ async def drain(timeout: int = 30):
     }
 
 
+def _scan_entry(file: Path, scan_root: Path, include_absolute: bool) -> dict:
+    """单个扫描条目：relative 相对“本次请求的目录”，path 可直接回传给 /run。"""
+    try:
+        resolved = file.resolve()
+    except OSError:
+        resolved = file
+    if resolved.is_relative_to(scan_root):
+        rel = resolved.relative_to(scan_root).as_posix()
+    else:
+        rel = file.name
+    entry = {"name": file.name, "relative": rel}
+    if include_absolute or _SCAN_ABSOLUTE_PATHS:
+        entry["path"] = str(resolved)
+    else:
+        try:
+            entry["path"] = resolved.relative_to(_SCRIPTS_DIR).as_posix()
+        except ValueError:
+            # 不在 scripts 目录内（额外扫描根）：绝对路径是唯一能回传 /run 的形式
+            entry["path"] = str(resolved)
+    try:
+        st = resolved.stat()
+        entry["size_bytes"] = st.st_size
+        entry["mtime"] = round(st.st_mtime, 3)
+    except OSError:
+        entry["size_bytes"] = 0
+        entry["mtime"] = 0.0
+    return entry
+
+
 @app.post("/scan", dependencies=[Depends(require_token)])
-async def scan_directory(dir_path: str = "", request: Request = None):
-    """扫描目录，返回所有 .py 文件列表。"""
+async def scan_directory(dir_path: str = "", recursive: bool = True,
+                         include_absolute: bool = False, request: Request = None):
+    """扫描目录，返回脚本列表（3.3.2 修 P2-4）。
+
+    - recursive：默认 True，递归子目录（跳过隐藏目录/__pycache__/.git/venv，不跟随符号链接），
+      深度上限 WF_SCAN_MAX_DEPTH，文件数上限 WF_SCAN_MAX_FILES（超出 truncated=true）；
+    - 默认只返回相对路径（不泄露主机目录结构），`path` 可直接回传给 /run；
+    - include_absolute=true（或 WF_SCAN_ABSOLUTE_PATHS=1）时额外返回绝对路径，兼容旧调用方。
+    """
+    result = {"files": [], "count": 0, "truncated": False, "recursive": recursive}
     if not dir_path:
-        return {"files": []}
+        return result
     p = Path(dir_path)
     if not p.exists():
         raise HTTPException(400, f"目录不存在: {dir_path}")
@@ -1353,16 +1538,46 @@ async def scan_directory(dir_path: str = "", request: Request = None):
             "目录不在允许的扫描根内：默认只允许 WF_SCRIPTS_DIR。"
             "如需扫描其它目录，请设置 WF_SCAN_ALLOWED_ROOTS（分号分隔多个根）后重启 script-server。",
         )
-    files = []
-    for f in sorted(p.glob("*.py")):
-        if f.name.startswith("."):
-            continue
-        files.append({
-            "name": f.name,
-            "relative": f.name,
-            "path": str(f.resolve()),
-        })
-    return {"files": files}
+
+    exts = tuple(_ALLOWED_EXTS) or (".py",)
+    skip_dirs = {"__pycache__", ".git", ".svn", ".hg", "node_modules", ".venv", "venv", "site-packages"}
+    files: List[dict] = []
+    truncated = False
+    if recursive:
+        base_depth = len(resolved.parts)
+        for dirpath, dirnames, filenames in os.walk(resolved, followlinks=False):
+            current = Path(dirpath)
+            if len(current.parts) - base_depth >= _SCAN_MAX_DEPTH:
+                dirnames[:] = []  # 到深度上限：不再往下走
+            else:
+                dirnames[:] = sorted(
+                    d for d in dirnames if not d.startswith(".") and d.lower() not in skip_dirs
+                )
+            for name in sorted(filenames):
+                if name.startswith(".") or Path(name).suffix.lower() not in exts:
+                    continue
+                files.append(_scan_entry(current / name, resolved, include_absolute))
+                if len(files) >= _SCAN_MAX_FILES:
+                    truncated = True
+                    break
+            if truncated:
+                break
+    else:
+        for f in sorted(resolved.glob("*")):
+            try:
+                if not f.is_file():
+                    continue
+            except OSError:
+                continue
+            if f.name.startswith(".") or f.suffix.lower() not in exts:
+                continue
+            files.append(_scan_entry(f, resolved, include_absolute))
+            if len(files) >= _SCAN_MAX_FILES:
+                truncated = True
+                break
+    files.sort(key=lambda item: item["relative"].lower())
+    result.update({"files": files, "count": len(files), "truncated": truncated})
+    return result
 
 
 @app.post("/run", response_model=RunResponse, dependencies=[Depends(require_token)])
@@ -1378,9 +1593,7 @@ async def run(req: RunRequest, request: Request = None):
             "执行器正在排空（升级/重启中），请稍后重试",
             headers={"Retry-After": "10"},
         )
-    extra_fields = sorted((req.model_extra or {}).keys())
-    if extra_fields:
-        logger.warning("POST /run 收到未识别字段（已忽略）: %s", ", ".join(extra_fields))
+    unknown_fields = _check_unknown_fields(req, client_ip)
     task_id = _get_task_id(req)
     explicit_id = bool((req.task_run_id or "").strip())
     started_monotonic = time.monotonic()
@@ -1411,8 +1624,12 @@ async def run(req: RunRequest, request: Request = None):
     if sum(len(k) + len(v) for k, v in env_extra.items()) > 65536:
         raise HTTPException(413, "env 过大（>64KB）")
     env_extra = _sanitize_env_extra(env_extra)
-    script_sig = _file_signature(script_path)
+    # 3.3.2（P2-7）：没传 task_run_id 就不做幂等，没必要每次把整份脚本读一遍算 sha256；
+    # 只 stat，审计里用 size/mtime 做对照。
+    script_sig = _file_signature(script_path, with_digest=explicit_id)
     script_sha = script_sig["sha256"][:16]
+    script_ctx = {"script_sha": script_sha, "script_size": script_sig["size"],
+                  "script_mtime_ns": script_sig["mtime_ns"]}
 
     # 2) 幂等：同一 task_run_id + 同一指纹的**成功**结果直接返回（失败不缓存，重试会真跑）
     request_fingerprint = _request_fingerprint(req, script_path, script_sig) if explicit_id else ""
@@ -1428,14 +1645,15 @@ async def run(req: RunRequest, request: Request = None):
                 cached.setdefault("timed_out", False)
                 response = RunResponse(**cached)
                 _audit("run.dedup", run_id=task_id, client=client_ip, script=script_path.name,
-                       script_sha=script_sha, args_sha=args_sha, code=response.code,
+                       **script_ctx, args_sha=args_sha, code=response.code,
                        exit_code=response.exit_code, status=response.status_label)
                 return response
             except Exception as exc:
                 logger.warning("缓存结果损坏，忽略并重新执行（task=%s）: %s", task_id, exc)
 
     # 3) 并发槽：reject=立即 429（带 Retry-After）；queue=排队等空槽，最多 WF_QUEUE_MAX_WAIT 秒
-    #    排队有上限（WF_QUEUE_MAX_DEPTH，默认 16）并登记到 _queue_waiters，/tasks 可见。
+    #    排队有上限（WF_QUEUE_MAX_DEPTH，默认 16）并登记到 _queue_waiters，/tasks 可见；
+    #    只有队头能抢槽 → 严格 FIFO，不会被后来的请求插队（3.3.2 修 P2-6）。
     queue_started = time.monotonic()
     queue_key: Optional[str] = None
     got_slot = _try_acquire_slot()
@@ -1454,10 +1672,10 @@ async def run(req: RunRequest, request: Request = None):
         deadline = queue_started + min(_QUEUE_MAX_WAIT, float(req.timeout_seconds))
         try:
             while time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
-                if _try_acquire_slot():
+                if _queue_is_head(queue_key) and _try_acquire_slot():
                     got_slot = True
                     break
+                await asyncio.sleep(0.05)
         finally:
             _queue_leave(queue_key)
         if not got_slot:
@@ -1474,7 +1692,8 @@ async def run(req: RunRequest, request: Request = None):
             headers={"Retry-After": "5"},
         )
     if queue_wait > 0.1:
-        _bump("queued")
+        _bump("queued")          # 兼容旧看板；口径见 queue_success
+        _bump("queue_success")
 
     handle: Optional[_TaskHandle] = None
     keep_handle = False
@@ -1507,9 +1726,10 @@ async def run(req: RunRequest, request: Request = None):
             handle.slot_held = True
         await _persist_running()
         _audit("run.start", run_id=task_id, explicit=explicit_id, client=client_ip,
-               script=script_path.name, script_sha=script_sha, args_len=len(req.args or ""),
+               script=script_path.name, **script_ctx, args_len=len(req.args or ""),
                args_sha=args_sha, env_keys=sorted(env_extra), timeout_s=req.timeout_seconds,
-               block_strategy=req.block_strategy, queue_wait_ms=round(queue_wait * 1000, 1))
+               block_strategy=req.block_strategy, queue_wait_ms=round(queue_wait * 1000, 1),
+               unknown_fields=unknown_fields)
 
         # 5) 子进程环境
         # 修复 P1-1：请求 env 已在 _sanitize_env_extra 里拒绝危险键；这里再做兜底剥离，
@@ -1554,11 +1774,12 @@ async def run(req: RunRequest, request: Request = None):
                 stderr="任务在启动阶段被取消",
                 success=False,
                 status_label="任务取消",
+                error_kind="cancelled",
                 cancelled=True,
                 duration_seconds=round(time.monotonic() - started_monotonic, 3),
             )
             _audit_finish(response, client=client_ip, script=script_path.name,
-                          script_sha=script_sha, args_sha=args_sha, phase="spawn")
+                          **script_ctx, args_sha=args_sha, phase="spawn")
             return response
 
         # 7) 并发读取两路输出（有上限），等待“退出 / 取消 / 超时”任一发生
@@ -1616,20 +1837,31 @@ async def run(req: RunRequest, request: Request = None):
             is_partial = returncode == 1 and not crashed
             if is_success:
                 status_label = _label(returncode)
+                result_code = 200
+                error_kind = "ok"
+            elif is_partial:
+                status_label = _label(returncode)
+                result_code = _PARTIAL_CODE   # 206（可 WF_PARTIAL_CODE=500 回退旧行为）
+                error_kind = "partial"
             elif crashed:
                 status_label = "脚本错误"
+                result_code = 500
+                error_kind = "script_error"
             else:
                 status_label = _label(returncode)
+                result_code = 500
+                error_kind = "script_error"
             logger.info("任务 %s 完成，退出码: %s", task_id, returncode)
             response = RunResponse(
                 task_id=task_id,
-                code=200 if is_success else 500,
+                code=result_code,
                 exit_code=returncode,
                 stdout=stdout_text,
                 stderr=stderr_text,
                 success=is_success,
                 partial=is_partial,
                 status_label=status_label,
+                error_kind=error_kind,
                 truncated=truncated,
                 duration_seconds=round(time.monotonic() - started_monotonic, 3),
             )
@@ -1657,6 +1889,7 @@ async def run(req: RunRequest, request: Request = None):
                 stderr=timeout_msg,
                 success=False,
                 status_label=_KILL_FAILED_LABEL if not kill_ok else "脚本超时",
+                error_kind="timeout",
                 timed_out=True,
                 truncated=truncated,
                 duration_seconds=round(time.monotonic() - started_monotonic, 3),
@@ -1685,6 +1918,7 @@ async def run(req: RunRequest, request: Request = None):
                 stderr=message,
                 success=False,
                 status_label=_KILL_FAILED_LABEL if not kill_ok else "任务取消",
+                error_kind="cancelled",
                 cancelled=True,
                 truncated=truncated,
                 duration_seconds=round(time.monotonic() - started_monotonic, 3),
@@ -1692,7 +1926,7 @@ async def run(req: RunRequest, request: Request = None):
             logger.info("任务 %s 已取消（%s），kill_ok=%s", task_id, reason_text, kill_ok)
             keep_handle = not kill_ok
 
-        _audit_finish(response, client=client_ip, script=script_path.name, script_sha=script_sha,
+        _audit_finish(response, client=client_ip, script=script_path.name, **script_ctx,
                       args_sha=args_sha, kill_failed=(not kill_ok if reason != "exited" else False))
         return response
 
@@ -1721,10 +1955,11 @@ async def run(req: RunRequest, request: Request = None):
             stdout="",
             stderr=traceback.format_exc(),
             success=False,
-            status_label="脚本错误",
+            status_label="执行器内部错误",
+            error_kind="executor_error",
             duration_seconds=round(time.monotonic() - started_monotonic, 3),
         )
-        _audit_finish(response, client=client_ip, script=script_path.name, script_sha=script_sha,
+        _audit_finish(response, client=client_ip, script=script_path.name, **script_ctx,
                       args_sha=args_sha, error=type(exc).__name__)
         return response
     except BaseException as exc:

@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
 import threading
 import time
@@ -23,15 +25,43 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent          # ...\script-server
 BASE = "http://127.0.0.1:9000"
-SCRIPTS_DIR = ROOT.parent / "scripts"
-PROBE = SCRIPTS_DIR / "_hardening_probe.py"
-FAIL_SCRIPT = SCRIPTS_DIR / "_hardening_fail.py"
-AUDIT_LOG = ROOT / "logs" / "script-server-audit.log"
 STAMP = time.strftime("%H%M%S")
 ARG_MARKER = "ARG-MARKER-" + uuid.uuid4().hex[:8]   # 用来验证「参数不落明文日志」的标记串
 
+
+def _read_env() -> dict:
+    values: dict[str, str] = {}
+    env_file = ROOT / ".env"
+    if not env_file.exists():
+        return values
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+# 3.3.2（P2-8）：探针不再直接堆在生产 scripts 根目录，而是统一放在一个隐藏子目录里，
+# 跑完即删；scripts 目录也从 .env 读，不写死。
+SCRIPTS_DIR = Path(
+    os.environ.get("WF_SCRIPTS_DIR")
+    or _read_env().get("WF_SCRIPTS_DIR")
+    or (ROOT.parent / "scripts")
+)
+PROBE_DIR = SCRIPTS_DIR / f".verify-hardening-{os.getpid()}"
+PROBE = PROBE_DIR / "probe.py"
+FAIL_SCRIPT = PROBE_DIR / "fail.py"
+AUDIT_LOG = ROOT / "logs" / "script-server-audit.log"
+
 FAILED: list[str] = []
 TOKEN = ""
+
+
+def _rel(path: Path) -> str:
+    """回传给 /run 的相对路径（相对 WF_SCRIPTS_DIR，posix 分隔）。"""
+    return path.relative_to(SCRIPTS_DIR).as_posix()
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -41,14 +71,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def _read_env_token() -> str:
-    env_file = ROOT / ".env"
-    if not env_file.exists():
-        return ""
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line.startswith("WF_SCRIPT_TOKEN="):
-            return line.split("=", 1)[1].strip()
-    return ""
+    return os.environ.get("WF_SCRIPT_TOKEN") or _read_env().get("WF_SCRIPT_TOKEN", "")
 
 
 def api(method: str, path: str, body: dict | None = None, timeout: float = 90.0):
@@ -113,7 +136,7 @@ def test_code_and_dedupe() -> tuple[bool, float]:
 
 def test_content_fingerprint() -> None:
     run_id = f"hard-content-{STAMP}"
-    body = {"file_path": PROBE.name, "timeout_seconds": 30, "task_run_id": run_id}
+    body = {"file_path": _rel(PROBE), "timeout_seconds": 30, "task_run_id": run_id}
     write_script(PROBE, "print('PROBE-A')\n")
     _s, _h, first = api("POST", "/run", body)
     write_script(PROBE, "print('PROBE-B')\n")
@@ -128,7 +151,7 @@ def test_content_fingerprint() -> None:
 def test_fail_code() -> None:
     write_script(FAIL_SCRIPT, "import sys\nprint('fail-probe')\nsys.exit(2)\n")
     status, _h, payload = api("POST", "/run",
-                              {"file_path": FAIL_SCRIPT.name, "timeout_seconds": 20})
+                              {"file_path": _rel(FAIL_SCRIPT), "timeout_seconds": 20})
     ok = status == 200 and payload.get("code") == 500 and payload.get("success") is False
     check("失败运行：code=500（HTTP 仍 200）", ok,
           f"HTTP {status} code={payload.get('code')} exit={payload.get('exit_code')}")
@@ -207,6 +230,7 @@ def main() -> int:
     if not TOKEN:
         print("[FATAL] .env 里没有 WF_SCRIPT_TOKEN，无法调用需要鉴权的接口")
         return 1
+    PROBE_DIR.mkdir(parents=True, exist_ok=True)
     try:
         test_version()
         test_code_and_dedupe()
@@ -216,11 +240,7 @@ def main() -> int:
         test_concurrency()
         test_audit_log()
     finally:
-        for path in (PROBE, FAIL_SCRIPT):
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        shutil.rmtree(PROBE_DIR, ignore_errors=True)
     print("=" * 60)
     print("结果：全部通过" if not FAILED else "结果：失败 " + ", ".join(FAILED))
     return 0 if not FAILED else 1

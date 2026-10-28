@@ -29,7 +29,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE = "http://127.0.0.1:9000"
-SCRIPTS = ROOT.parent / "scripts"
 STATE = Path(os.environ.get("WF_SCRIPT_STATE_DIR") or (ROOT.parent / ".script_server_state"))
 AUDIT = ROOT / "logs" / "script-server-audit.log"
 STAMP = time.strftime("%H%M%S")

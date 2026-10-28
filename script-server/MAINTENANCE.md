@@ -1,6 +1,6 @@
 # script-server 执行器 · 运维手册
 
-> 适用版本：`script_server.py` **3.3.1**；托管方式：**Windows 计划任务直接运行 `deploy\serve.py` + 1 分钟 watchdog**。
+> 适用版本：`script_server.py` **3.3.2**；托管方式：**Windows 计划任务直接运行 `deploy\serve.py` + 1 分钟 watchdog**。
 > 安装/首次验收见 [`INSTALL.md`](INSTALL.md)。
 > 本文“实测”均指 2026-10-27 在 192.168.1.210（SERVICE）上的实际结果。
 
@@ -146,14 +146,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ops tasks    # 运行中任
 
 判据：
 
-- `/health` 200：进程活着；`version=3.3.1`、`auth_required=true`、`draining=false`；`queue.depth` 持续 >0 说明在排队、平台侧应降并发。
+- `/health` 200：进程活着；`version=3.3.2`、`auth_required=true`、`draining=false`；`queue.depth` 持续 >0 说明在排队、平台侧应降并发。
 - `/health/ready` 200 且 `status=ok`：脚本目录可写、状态目录可用、解释器存在、并发未满。
 - `status=degraded`：活着但不能执行（看 `checks` 哪项 false）。
 - 401：调用方 token ≠ `.env`。
 - `/tasks` 的 `elapsed_seconds` 远超 `timeout_seconds` → 卡死，`POST /cancel/{task_id}`。
 
 告警建议：`/health/ready` 连续 3 次非 200 或 `degraded`；端口不可达 > 60s；
-`counters.spawn_errors` / `kill_failed` / `rejected_busy` / `conflict_409` 持续增长。
+`counters.spawn_errors` / `kill_failed` / `rejected_busy` / `conflict_409` 持续增长；
+`counters.invalid_fields` / `unknown_fields` 增长说明平台请求字段写错（3.3.2 起可见）。
 
 ## 7. 排空、升级、回滚
 
@@ -234,6 +235,7 @@ curl.exe -s -o NUL -w "%{http_code}" -H "X-Script-Token: <新>" http://127.0.0.1
 
 | 日期 | 变更 |
 |---|---|
+| 2026-10-28 | **3.3.2**：`args` 空引号不再丢参数；请求体错拼字段 400（`timeout`→`timeout_seconds` 等）+ `WF_STRICT_FIELDS`；partial 改 `code=206`、新增 `error_kind`（`ok/partial/script_error/timeout/cancelled/executor_error`）；`/scan` 递归 + 相对路径（`include_absolute` 兼容）；`/health/ready` 写探测按 TTL 缓存；排队严格 FIFO（`position`）+ `queue_success`；未传 `task_run_id` 时跳过 sha256；新增 `tests\`（26 项）与 `verify-p2.py`（16 项）、CI |
 | 2026-10-28 | **3.3.1**：修 `except` 顺序（内部异常不再裸 500，`spawn_errors` 正常计数）；`env`/`args` 含 NUL 直接 400；queue 可观测 + 上限 `WF_QUEUE_MAX_DEPTH`；`running.json` 脱敏（只留 `args_sha`）；审计补 `auth.fail`/`path.deny` 且改纯 JSON；`verify-10.ps1` 版本号改为动态读取；新增 `verify-p1.py` |
 | 2026-10-28 | **3.3.0**：幂等指纹加入脚本内容 sha256（脚本改了会重跑）；响应新增 `code`（200/500/502）与 `timed_out`；新增 `block_strategy`（reject 默认 / queue 排队）、429/409 带 `Retry-After`；新增审计日志 `script-server-audit.log`（服务日志共 4 份）且运行日志不再落明文 argv；未知字段打 WARNING；新增在线验收 `deploy\verify-hardening.py`（11 项） |
 | 2026-10-28 | 日志拆成 access / out / error 三份，内置按天轮转、保留 14 天（`serve.py:setup_logging()`）；新增离线验收 `deploy\verify-logging.py`；`ops-http.ps1 logs` 显示三份 + 归档 |

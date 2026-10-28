@@ -2,7 +2,7 @@
 
 > 适用：**只装执行器**的 Windows 设备（平台 backend/Redis 在别的机器）。
 > 目标：`http://<新设备IP>:9000` 提供鉴权后的脚本执行能力，平台「设备管理」里能探活并派发任务。
-> 版本：script-server 3.3.0；**托管方式：Windows 计划任务直接跑 `python deploy\serve.py` + 1 分钟 watchdog**，无第三方守护进程。
+> 版本：script-server 3.3.2；**托管方式：Windows 计划任务直接跑 `python deploy\serve.py` + 1 分钟 watchdog**，无第三方守护进程。
 > 本文命令均以 `C:\ScriptServer\script-server` 为例，按实际路径替换。
 
 ## 0. 需要装什么（一句话）
@@ -106,7 +106,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\ScriptServer\script-serve
 ## 5. 验证
 
 ```powershell
-# 5.1 健康（不需要 token）：应看到 version=3.3.0、auth_required=true
+# 5.1 健康（不需要 token）：应看到 version=3.3.2、auth_required=true
 curl.exe http://127.0.0.1:9000/health
 
 # 5.2 就绪（需要 token）：status=ok + checks（解释器/目录/状态目录/并发）
@@ -182,7 +182,7 @@ WF_SCAN_ALLOWED_ROOTS=D:\other-scripts;E:\jobs
 | 现象 | 处理 |
 |---|---|
 | `install.bat` 闪退 | 用 cmd 打开再运行，或在命令行跑 `install.bat -nopause` 看报错；需管理员 |
-| `/health` 404 或字段很少 | 跑的是旧代码/旧进程：`ops-http.ps1 restart` 后看 `version=3.3.0` |
+| `/health` 404 或字段很少 | 跑的是旧代码/旧进程：`ops-http.ps1 restart` 后看 `version=3.3.2` |
 | 平台「检测」401/离线 | 设备里登记的 token 与 `.env` 的 `WF_SCRIPT_TOKEN` 不一致（不用重启执行器） |
 | `POST /run` 403 | 路径不在允许目录：用相对路径或配 `WF_ALLOWED_SCRIPT_ROOTS` |
 | `WinError 10048`（端口占用） | 残留进程：`netstat -ano | findstr :9000` → `taskkill /F /T /PID <pid>` → `ops-http.ps1 restart` |

@@ -1,9 +1,9 @@
 # script-server（脚本执行器）新设备安装与使用说明
 
-> **适用版本**：`script_server.py` VERSION = **3.3.1**（单文件 FastAPI）
+> **适用版本**：`script_server.py` VERSION = **3.3.2**（单文件 FastAPI）
 > **适用对象**：在一台全新 Windows 机器上安装、启动、接入平台的运维/实施工程师
 > **托管方式**：Windows 计划任务直接运行 `deploy\serve.py`，另有 1 分钟 watchdog 兜底（只依赖 Python）
-> **文档日期**：2026-10-27（按新托管方式重写）
+> **文档日期**：2026-10-28（3.3.2 修订：P2 修复项）
 > **配套材料**：[`MAINTENANCE.md`](MAINTENANCE.md)（日常运维 / 排障 / 升级 / 回退）
 
 ---
@@ -347,7 +347,7 @@ cd C:\ScriptServer\script-server
 python .\deploy\serve.py --host 127.0.0.1 --port 9000
 ```
 
-看到 `[serve] start pid=... version=3.3.1 ...` 与 `Uvicorn running on http://127.0.0.1:9000` 即成功；
+看到 `[serve] start pid=... version=3.3.2 ...` 与 `Uvicorn running on http://127.0.0.1:9000` 即成功；
 另开窗口验证后 `Ctrl+C` 停止。前台方式日志只在控制台，生产不要这么跑。
 
 **方式 B：计划任务（生产标准做法）**
@@ -497,7 +497,7 @@ Start-Process powershell.exe -Verb RunAs -ArgumentList @(
 | # | 检查 | 命令 | 通过判据 | 失败先查 |
 |---|---|---|---|---|
 | 1 | 端口监听 | `netstat -ano \| findstr :9000` | 有 `LISTENING` | 进程没起 / 端口被占（`WinError 10048`）→ `ops-http.ps1 logs` |
-| 2 | 公开探活 | `curl.exe -s http://127.0.0.1:9000/health` | 200，`version=3.3.1`，`auth_required=true`，`draining=false` | 仍是 `auth_required=false` → `.env` 未生效；版本不是 3.3.1 → 跑了旧代码 |
+| 2 | 公开探活 | `curl.exe -s http://127.0.0.1:9000/health` | 200，`version=3.3.2`，`auth_required=true`，`draining=false` | 仍是 `auth_required=false` → `.env` 未生效；版本不是 3.3.2 → 跑了旧代码 |
 | 3 | 无 token 拒绝 | `curl.exe -s -o NUL -w "%{http_code}" http://127.0.0.1:9000/health/ready` | `401` | 返回 200 → token 没配（危险） |
 | 4 | 带 token 就绪 | `curl.exe -s -H "X-Script-Token: $t" http://127.0.0.1:9000/health/ready` | `status=ok`，`checks.state_dir.enabled=true`，`checks.python.exists=true` | `degraded` → 看 `checks` 哪个 `false` |
 | 5 | Bearer 兼容 | `-H "Authorization: Bearer $t"` 调 `/health/ready` | 200 | — |
@@ -563,7 +563,7 @@ curl.exe -s -X POST "$base/run" -H "X-Script-Token: $t" -H "Content-Type: applic
 | GET | `/health` | 否（公开） | 进程存活探针 |
 | GET | `/health/ready` | **是** | 就绪探针（能不能执行） |
 | POST | `/run` | **是** | 执行脚本（同步返回结果） |
-| POST | `/scan?dir_path=<绝对路径>` | **是** | 扫描目录第一层 `*.py` |
+| POST | `/scan?dir_path=<绝对路径>[&recursive=true][&include_absolute=false]` | **是** | 扫描目录（默认递归、返回相对路径） |
 | POST | `/cancel/{task_id}` | **是** | 取消运行中任务（杀进程树） |
 | GET | `/tasks` | **是** | 列出运行中任务 |
 | POST | `/drain?timeout=30` | **是** | 排空：拒绝新任务并等存量结束 |
@@ -581,20 +581,21 @@ Authorization: Bearer <WF_SCRIPT_TOKEN>
 |---|---|---|
 | 鉴权 | 公开 | 需 token |
 | 含义 | **进程活着**（`status` 恒为 `ok`） | **现在能不能执行**（`ok` / `degraded`） |
-| 关键字段 | `version`、`auth_required`、`draining`、`running_tasks`、`counters` | `checks.scripts_dir{writable}`、`checks.state_dir{enabled}`、`checks.python.path`、`checks.concurrency` |
+| 关键字段 | `version`、`auth_required`、`draining`、`running_tasks`、`queue`、`counters` | `checks.scripts_dir{writable,writable_from_cache}`、`checks.state_dir{enabled}`、`checks.python.path`、`checks.concurrency` |
 | 注意 | 不泄露内部路径；**不能**用它判断"能执行" | HTTP 码仍是 200，**必须看 `status` 字段** |
 
 `/health` 示例：
 
 ```json
-{"status":"ok","version":"3.3.1","auth_required":true,"draining":false,
+{"status":"ok","version":"3.3.2","auth_required":true,"draining":false,
  "running_tasks":0,"queue":{"depth":0,"limit":16},"uptime_seconds":9.7,
  "counters":{"requests":0,"spawned":0,"run_success":0}}
 ```
 
-> 上例 `counters` 为**节选**，实际有 22 个计数键（含 `spawn_errors`、`kill_failed`、`rejected_busy`、
-> `queued`、`queue_timeout`、`queue_full_rejected`、`conflict_409`、`deduplicated`、
-> `auth_failed`、`path_denied`、`orphans_killed_at_startup` 等），排障时看它们更直接。
+> 上例 `counters` 为**节选**，实际有 24 个计数键（含 `spawn_errors`、`kill_failed`、`rejected_busy`、
+> `queued`、`queue_success`、`queue_timeout`、`queue_full_rejected`、`conflict_409`、`deduplicated`、
+> `auth_failed`、`path_denied`、`unknown_fields`、`invalid_fields`、`orphans_killed_at_startup` 等），
+> 排障时看它们更直接。
 
 `/health/ready` 判读规则：
 
@@ -672,12 +673,13 @@ print(data["stdout"])
 | 字段 | 说明 |
 |---|---|
 | `task_id` | 本次任务 ID（= 传入的 `task_run_id`，否则自动生成） |
-| `code` | **三态判定码**：`200` 成功 / `500` 失败或取消 / `502` 超时（与 `exit_code` 互补，平台建议优先看它） |
+| `code` | **判定码**：`200` 成功 / `206` 部分成功（exit 1） / `500` 失败或取消 / `502` 超时（与 `exit_code` 互补，平台建议优先看它） |
 | `exit_code` | 退出码；**超时/取消为 -1**；服务端内部异常为 3 |
 | `stdout` / `stderr` | 标准输出/错误（UTF-8/GBK 智能解码；超上限截断） |
 | `success` | 仅 `exit_code==0` 为 true |
 | `partial` | `exit_code==1` 且不是崩溃时为 true（"部分成功"） |
-| `status_label` | 成功 / 部分成功 / 网络错误 / 脚本错误 / 脚本超时 / 任务取消 / 终止失败 |
+| `error_kind` | **最精确的一维分类（3.3.2 新增）**：`ok` / `partial` / `script_error` / `timeout` / `cancelled` / `executor_error`；`executor_error` = 执行器自身故障（spawn 失败、内部异常），与脚本自己失败分开 |
+| `status_label` | 成功 / 部分成功 / 网络错误 / 脚本错误 / 脚本超时 / 任务取消 / 终止失败 / 执行器内部错误 |
 | `cancelled` | 是否因取消（/cancel、断连、关停）结束 |
 | `timed_out` | 是否因超时结束（此时 `code=502`） |
 | `deduplicated` | 是否命中幂等缓存（本次未真正执行） |
@@ -688,8 +690,8 @@ print(data["stdout"])
 
 ```json
 {"task_id":"manual-001","code":200,"exit_code":0,"stdout":"hello from script-server\n","stderr":"",
- "success":true,"partial":false,"status_label":"成功","cancelled":false,"timed_out":false,
- "deduplicated":false,"truncated":false,"duration_seconds":0.42}
+ "success":true,"partial":false,"status_label":"成功","error_kind":"ok","cancelled":false,
+ "timed_out":false,"deduplicated":false,"truncated":false,"duration_seconds":0.42}
 ```
 
 #### 幂等与"平台重试"的关系（3.3.0，务必读懂）
@@ -697,7 +699,7 @@ print(data["stdout"])
 | 情况（同一个 `task_run_id`） | 执行器行为 | 平台该怎么做 |
 |---|---|---|
 | 上次**成功**，响应丢了又重投 | 返回历史结果（`deduplicated=true`，`code=200`），**不会二次执行** | 当成成功继续；不要再换 ID 重跑（会产生重复副作用） |
-| 上次**失败/超时/取消**（exit≠0、`code=500/502`） | **不缓存**，重投会真正重跑 | 正常重试即可，幂等不会挡 |
+| 上次**失败/超时/取消**（exit≠0、`code=206/500/502`） | **不缓存**，重投会真正重跑 | 正常重试即可，幂等不会挡 |
 | 上次**还在运行** | `409` + `Retry-After` | 等几秒再查 `/tasks`，不要当成执行失败 |
 | 从未见过这个 ID | 正常执行 | — |
 | 脚本**内容改过**了，仍用旧 ID | 指纹含脚本 sha256 → 判定为新请求，**重跑**（不会返回旧结果） | 无需处理 |
@@ -711,14 +713,14 @@ print(data["stdout"])
 | 码 | 场景 | 调用方处理 |
 |---|---|---|
 | **200** | 脚本执行完成（**含失败/超时/取消**，看 `exit_code`/`status_label`） | 按 `exit_code` 判定业务结果 |
-| 400 | 路径无效/不存在/不是文件、args 引号未闭合或含 NUL、env 键非法或值含 NUL | 修正参数，不要重试 |
+| 400 | 路径无效/不存在/不是文件、args 引号未闭合或含 NUL、env 键非法或值含 NUL、**请求体含错拼字段**（如 `timeout`→`timeout_seconds`，3.3.2 起返回 400 并提示正确字段名；其它未知字段默认只告警，`WF_STRICT_FIELDS=1` 时也 400） | 修正参数，不要重试 |
 | 401 | token 缺失/错误 | 检查 token，不要重试 |
 | 403 | 路径在允许目录外、扩展名不允许 | 修正路径/配置，不要重试 |
 | 409 | 同 `task_run_id` 仍在运行（含"刚退出还没收尾"的窗口） | 响应带 `Retry-After: 5`；等几秒后查 `/tasks`，确认是"上次响应丢了"还是平台超时判失败 |
 | 413 | `args` 或 `env` 超过 65536 个字符 | 减少参数 |
 | 422 | 请求体不合法（timeout 越界、类型错、JSON 错） | 修正请求 |
 | 429 | 并发已满（默认 4），响应带 `Retry-After: 5` | 退避重试，或改传 `"block_strategy":"queue"` 让执行器排队 |
-| 500 | 只用于 `/cancel` 杀进程树失败等 HTTP 层异常；**`/run` 的服务端内部异常返回 200 + `code=500` + `exit_code=3`**（3.3.1 起稳定），不要只看 HTTP 码 | 看 `counters.spawn_errors` / `counters.kill_failed` 与 error.log |
+| 500 | 只用于 `/cancel` 杀进程树失败等 HTTP 层异常；**`/run` 的服务端内部异常返回 200 + `code=500` + `error_kind=executor_error` + `exit_code=3`**（3.3.1 起稳定），不要只看 HTTP 码 | 看 `counters.spawn_errors` / `counters.kill_failed` 与 error.log |
 | 503 | 排空模式（调过 `/drain`） | 等待重启恢复；响应带 `Retry-After: 10` |
 
 #### 退出码语义（平台按它判定，务必读懂）
@@ -728,7 +730,7 @@ print(data["stdout"])
 | `0` | 成功 | true | false | 成功 |
 | `1` | 部分成功（stderr 含 `Traceback` 时显示"脚本错误"） | false | 通常 true | **部分成功**，平台工作流继续（标警告） |
 | `2` | 网络错误（只是文案） | false | false | 失败 |
-| `3` | 脚本错误 | false | false | 失败（服务端内部异常也返回 3） |
+| `3` | 脚本错误（服务端内部异常也返回 3，此时 `error_kind=executor_error`） | false | false | 失败 |
 | **`-1`** | 脚本超时 / 任务取消 / 终止失败 | false | false | 失败；看 `cancelled` 区分取消 |
 | 4 / 5 | 仅文案表存在 | — | — | **执行器自己从不返回 4/5** |
 | 其它 | `未知(N)` | false | false | 失败 |
@@ -748,9 +750,13 @@ curl.exe -s -X POST -G --data-urlencode "dir_path=C:\ScriptServer\scripts" `
   -H "X-Script-Token: $t" http://127.0.0.1:9000/scan
 ```
 
-- `dir_path` 省略/空 → `{"files":[]}`；不存在/是文件 → 400；
+- `dir_path` 省略/空 → `{"files":[],"count":0,"truncated":false}`；不存在/是文件 → 400；
 - **相对路径按服务进程 CWD 解析**，`dir_path=.` 通常 403，别用；
-- 只扫第一层 `*.py`（**不递归**），返回 `name/relative/path`（`path` 是绝对路径）。
+- **默认递归**（3.3.2 起）：跳过隐藏目录、`__pycache__`、`.git`、`venv`，不跟随符号链接；
+  深度上限 `WF_SCAN_MAX_DEPTH`（8），文件数上限 `WF_SCAN_MAX_FILES`（2000，超出 `truncated=true`）；
+- 每条返回 `name` / `relative`（相对本次 `dir_path`）/ `path` / `size_bytes` / `mtime`；
+- **`path` 默认是相对路径，可直接回传 `/run`**（不在 `WF_SCRIPTS_DIR` 内的额外根才返回绝对路径）；
+  需要旧行为（绝对路径）时加 `&include_absolute=true`，或设 `WF_SCAN_ABSOLUTE_PATHS=1`。
 
 **`GET /tasks`**：
 
@@ -759,7 +765,8 @@ curl.exe -s -H "X-Script-Token: $t" http://127.0.0.1:9000/tasks
 ```
 
 返回 `count`、`tasks[]`（`task_id/pid/script/elapsed_seconds/timeout_seconds/cancelling`）、
-`concurrency_limit`，以及 `queue{depth,limit,max_wait_seconds,waiting[]}`（排队中的请求，3.3.1 起可见）；
+`concurrency_limit`，以及 `queue{depth,limit,max_wait_seconds,waiting[]}`（排队中的请求，3.3.1 起可见；
+`waiting[]` 每项含 `task_id/script/waited_seconds/position`，3.3.2 起 **严格 FIFO**，`position=1` 是队头）；
 内存台账，**重启即清空**。`elapsed_seconds` 远超 `timeout_seconds` 说明卡死，按 pid 排查或取消。
 
 **`POST /cancel/{task_id}`**：
@@ -954,9 +961,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ops logs      # 服务日�
 
 ### 7.3 已知限制
 
-- 无 Web UI、无 TLS、单 token 无租户隔离；
+- 无 Web UI、无 TLS、单 token 无租户隔离（TLS/反代与降权见 7.2 第 2、4 条）；
 - 同步长任务协议：一次 HTTP 等到脚本结束，重启/断电会中断在跑任务；
-- 幂等缓存只缓存成功结果，指纹不含脚本内容；
+- 幂等缓存只缓存成功结果（指纹含脚本内容 sha256，脚本改了会重跑）；
 - 取消能力依赖单进程内存台账，**不能**多 worker；
 - `running.json` 对账能清理大部分孤儿进程，但极端情况下（kill 失败）仍可能残留。
 
@@ -972,6 +979,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ops logs      # 服务日�
 | `WF_SCRIPTS_DIR` | `<script_server.py 所在目录>\scripts\` | 脚本根目录（默认值随启动方式不同） | **本文布局下必填**，写绝对路径 |
 | `WF_ALLOWED_SCRIPT_ROOTS` | 空（仅 `WF_SCRIPTS_DIR`） | 额外允许的绝对路径根（**分号**分隔） | 确需时加 |
 | `WF_SCAN_ALLOWED_ROOTS` | 空（仅 `WF_SCRIPTS_DIR`） | `/scan` 允许的根（分号分隔） | 按需 |
+| `WF_SCAN_MAX_FILES` | 2000 | `/scan` 单次返回文件数上限（超出 `truncated=true`） | 脚本很多时调大 |
+| `WF_SCAN_MAX_DEPTH` | 8 | `/scan` 递归深度上限 | 目录很深时调大 |
+| `WF_SCAN_ABSOLUTE_PATHS` | 0 | 1 = `/scan` 默认返回绝对路径（旧行为） | 平台还依赖绝对路径时设 1 |
+| `WF_PARTIAL_CODE` | 206 | 脚本 exit 1（部分成功）返回的 `code`：206 / 500（回退旧行为）/ 200 | 平台按旧口径判失败时设 500 |
+| `WF_STRICT_FIELDS` | 0 | 1 = `/run` 出现未知字段直接 400（0=告警忽略） | 确认调用方无多余字段后设 1 |
+| `WF_READY_PROBE_TTL_SECONDS` | 300 | `/health/ready` 写探测结果缓存秒数（0=每次都写） | 一般不改 |
 | `WF_ALLOWED_SCRIPT_EXTENSIONS` | `.py,.pyw` | 允许执行的扩展名（逗号分隔） | 一般不改 |
 | `WF_MAX_CONCURRENCY` | 4 | 同时执行脚本数上限，超出 429 | 按 CPU/内存调 |
 | `WF_QUEUE_MAX_WAIT_SECONDS` | 30 | `block_strategy=queue` 最长排队秒数（同时不超过本次 timeout） | 平台 HTTP 超时须大于“排队+执行” |
@@ -1111,5 +1124,23 @@ Get-ScheduledTask -TaskName 'WorkflowPlatform-ScriptServer-Watchdog' | Format-Li
 
 ---
 
-本文依据 `script_server.py` 3.3.1、`deploy\serve.py`、`.env.example`、`deploy\*` 脚本与 192.168.1.210 的实测记录编写。
+## 附录 G：3.3.2（2026-10-28）变更——P2 修复
+
+| # | 变更 | 影响 |
+|---|---|---|
+| 1 | `args` 空引号不再丢参数 | `a "" b` → `['a','','b']`；`""` → 一个空参数（过去会被吞掉，导致 argv 少一位、后续参数整体错位） |
+| 2 | 请求体字段严格校验 | 错拼字段（`timeout`/`timeout_ms`/`filepath`/`argv`/`task_id`…）返回 **400 并提示正确字段名**；其它未知字段 WARNING + `counters.unknown_fields` + 审计 `unknown_fields`；`WF_STRICT_FIELDS=1` 时全部 400 |
+| 3 | `exit 1` 与失败区分开 | 部分成功返回 **`code=206`**（`WF_PARTIAL_CODE=500` 可回退）；新增 `error_kind`：`ok/partial/script_error/timeout/cancelled/executor_error`，执行器自身故障不再和脚本失败混在一起 |
+| 4 | `/scan` 递归 + 相对路径 | 默认递归（深度/文件数有上限，`truncated` 标记）；`path` 默认相对、可直接回传 `/run`；不再泄露主机目录结构；`include_absolute=true` 兼容旧调用方 |
+| 5 | `/health/ready` 不再每次写盘 | 写探测结果按 `WF_READY_PROBE_TTL_SECONDS`（默认 300s）缓存，响应新增 `writable_from_cache` / `probe_ttl_seconds` |
+| 6 | 排队严格 FIFO + 计数补全 | 只有队头能抢空槽，`/tasks.queue.waiting[].position` 从 1 开始；新增 `queue_success`（`queued` 保留为兼容别名） |
+| 7 | 未传 `task_run_id` 时不再算脚本 sha256 | 省一次全文件读取；审计改用 `script_size`/`script_mtime_ns` 对照（`script_sha` 为空表示本次未计算） |
+| 8 | 新增 `tests\`（26 项单测）+ CI | 覆盖 args 切分、字段校验、结果分类、`/scan`、队列 FIFO、探测缓存；`verify-hardening.py` / `verify-p2.py` 探针改放隐藏临时目录并自动清理 |
+| 9 | 新增在线验收 `deploy\verify-p2.py` | 16 项，覆盖上面第 1–6 条，任何已部署实例都能跑 |
+
+验收（本机 2026-10-28 实测）：`tests` 26/26、`verify-p2.py` 16/16、`verify-10.ps1` 10/10、`verify-hardening.py` 11/11、`verify-logging.py` 17/17、`verify-p1.py` 20/20。
+
+---
+
+本文依据 `script_server.py` 3.3.2、`deploy\serve.py`、`.env.example`、`deploy\*` 脚本与 192.168.1.210 的实测记录编写。
 托管方式、开机自启、watchdog 恢复与平台端到端链路在该机已实测；新设备仍请按第 3 章验收。
