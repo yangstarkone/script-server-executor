@@ -6,9 +6,11 @@ Windows 上的独立脚本执行器（script-server，FastAPI + uvicorn，VERSIO
 ## 文档
 
 - 安装与验收：[script-server/INSTALL.md](script-server/INSTALL.md)
-- 安装记录（按设备分节）：[script-server/INSTALL-RECORD.md](script-server/INSTALL-RECORD.md)
+- 新设备部署（简版）：[script-server/deploy/INSTALL-EXECUTOR.md](script-server/deploy/INSTALL-EXECUTOR.md)
+- 安装/验收记录（按设备）：[script-server/INSTALL-RECORD.md](script-server/INSTALL-RECORD.md)
 - 运维手册：[script-server/MAINTENANCE.md](script-server/MAINTENANCE.md)
 - 部署脚本：[script-server/deploy/](script-server/deploy/)
+- 测评报告（2026-10-27）：[script-server/EXECUTOR-EVAL-20261027.md](script-server/EXECUTOR-EVAL-20261027.md)
 - 跨会话项目记忆：[PROJECT_LOG.md](PROJECT_LOG.md)
 
 ## 敏感信息

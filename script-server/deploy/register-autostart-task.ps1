@@ -1,16 +1,15 @@
 # register-autostart-task.ps1 - register (or remove) the script-server autostart task.
 #
-# Architecture (no PM2):
+# Architecture (task-scheduler hosted):
 #   Windows Task Scheduler task "WorkflowPlatform-ScriptServer"
 #     trigger  : AtStartup          -> service comes up after reboot WITHOUT a login
 #     principal: S4U + RunLevel Highest (runs as this account, no stored password)
 #     action   : <python.exe> "C:\ScriptServer\script-server\deploy\serve.py"
 #     settings : MultipleInstances IgnoreNew; restart every 1 min on failure, 999 times
 #
-#   serve.py loads .env, redirects stdout/stderr into logs\script-server-*.log and
-#   runs uvicorn in the foreground (single worker) - one plain python process, no PM2
-#   daemon and no cross-session named pipe (that combination used to break `pm2` with
-#   "connect EPERM \\.\pipe\rpc.sock" when the task resurrected PM2 in Session 0).
+#   serve.py loads .env, writes logs into logs\script-server-*.log and runs uvicorn in
+#   the foreground (single worker) - one plain python process, no daemon layer and no
+#   cross-session named pipes involved.
 #
 # Usage (ELEVATED PowerShell / "Run as administrator"):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File deploy\register-autostart-task.ps1
@@ -146,7 +145,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable
 $principal = New-ScheduledTaskPrincipal -UserId ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME) `
     -LogonType S4U -RunLevel Highest
-$description = 'script-server executor (standalone): python deploy\serve.py, uvicorn 0.0.0.0:9000, single worker. No PM2.'
+$description = 'script-server executor (standalone): python deploy\serve.py, uvicorn 0.0.0.0:9000, single worker.'
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -Principal $principal -Description $description -Force | Out-Null
 Write-Log '[2/5] task registered'

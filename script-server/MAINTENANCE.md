@@ -11,7 +11,7 @@ Windows Task Scheduler
 ├─ WorkflowPlatform-ScriptServer          AtStartup / S4U / Highest / 无时长限制
 │    └─ python.exe deploy\serve.py  ──►  uvicorn  0.0.0.0:9000   （进程即服务本体）
 │          · 每次启动重读 .env
-│          · stdout/stderr → logs\script-server-out.log / -error.log
+│          · 日志 3 份（access / out / error），按天轮转、保留 14 天（见 §5）
 │          · 进程退出后任务不会自己重跑（见 §4）
 └─ WorkflowPlatform-ScriptServer-Watchdog  每 1 分钟 / S4U / Highest
      └─ powershell deploy\watchdog.ps1
@@ -30,7 +30,7 @@ Windows Task Scheduler
 | 配置 | `.env`（token / 脚本目录 / 状态目录 / 并发） |
 | 业务脚本 | `C:\ScriptServer\scripts`，额外允许根 `E:\workflow-scripts-center` |
 | 状态目录 | `C:\ScriptServer\.script_server_state`（缓存 + running.json） |
-| 服务日志 | `logs\script-server-out.log`、`logs\script-server-error.log` |
+| 服务日志 | `logs\script-server-out.log`（业务 INFO+）、`logs\script-server-error.log`（仅 ERROR+）、`logs\script-server-access.log`（每请求一行）；均在本地按天轮转，保留 14 天 |
 | 看护日志 | `logs\watchdog.log` |
 | 切换日志 | `C:\ScriptServer\logs\cutover.log` |
 | 运维入口 | `deploy\ops-http.ps1`、`start-script-server.bat`、`env-change-restart.bat` |
@@ -104,27 +104,31 @@ Get-Content C:\ScriptServer\script-server\logs\watchdog.log -Tail 10 -Encoding U
 
 | 日志 | 位置 | 内容 |
 |---|---|---|
-| 服务输出 | `logs\script-server-out.log` | uvicorn access、`[serve] start pid=...` |
-| 服务错误 | `logs\script-server-error.log` | 启动 INFO、异常栈 |
+| 服务输出 | `logs\script-server-out.log` | 业务/服务 INFO+：`[serve] start`、任务启动/完成/超时/取消、WARNING，以及 ERROR 的副本（完整时间线） |
+| 服务错误 | `logs\script-server-error.log` | **仅 ERROR+**：异常栈、`kill_failed`、状态目录不可写等；平时应为空 |
+| 访问日志 | `logs\script-server-access.log` | 一次 HTTP 请求一行（客户端、方法、路径、状态码）；每请求都写，量最大 |
 | 看护 | `logs\watchdog.log` | 仅在“掉了→拉起”时写 |
 | 切换 | `C:\ScriptServer\logs\cutover.log` | 安装/切换过程 |
 | 验收结果 | `C:\ScriptServer\logs\verify-result.json` | `verify-10.ps1` 的 JSON |
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File $ops logs   # 两个服务日志 + 切换日志（UTF-8）
+powershell -NoProfile -ExecutionPolicy Bypass -File $ops logs   # 三份服务日志 + 归档列表 + 切换日志（UTF-8）
 ```
 
-**没有自动轮转**（`serve.py` 以追加方式直接写文件，没有内置轮转）。单机约 100KB/天，短期无风险；长期建议每月归档：
+**已内置轮转**（`serve.py` 的 `setup_logging()`，2026-10-28 起）：三份日志都按天切分，
+历史文件名为 `<文件名>.YYYY-MM-DD`，每份保留 **14 份**（更旧的自动删除），不需要任何外部轮转工具或额外计划任务。
+分配规则：`uvicorn.access` → access；root（业务 + `uvicorn.error`）→ out（INFO+）与 error（ERROR+），
+所以 ERROR 在 out 与 error 里各有一份（out 保留完整时间线，error 只用来盯错误）。
 
 ```powershell
-# 停任务 → 改名 → 起任务（serve.py 以追加方式打开新文件）
-schtasks /End /TN "WorkflowPlatform-ScriptServer"
-Get-ChildItem C:\ScriptServer\script-server\logs\*.log |
-  ForEach-Object { Move-Item $_.FullName ($_.FullName + '.' + (Get-Date -Format yyyyMMdd)) -Force }
-schtasks /Run /TN "WorkflowPlatform-ScriptServer"
+# 自查（离线验收：分级/中文/14 份默认/轮转与保留是否真的生效）
+python C:\ScriptServer\script-server\deploy\verify-logging.py
+# 看当前和历史
+Get-ChildItem C:\ScriptServer\script-server\logs\script-server-*.log* | Sort-Object LastWriteTime -Descending | Select-Object Name,Length,LastWriteTime
 ```
 
-日志含完整 args，可能敏感；读中文用 `-Encoding UTF8`。
+磁盘估算：访问日志约 80B/请求，业务日志约 200~400B/任务，按当前量级 14 天最多几十 MB；
+无上限兜底，若哪天请求量突增，先看 `access.log` 的日增大小再决定是否缩短保留份数（`LOG_BACKUP_DAYS`）。
 
 ## 6. 巡检与告警
 
@@ -224,4 +228,6 @@ curl.exe -s -o NUL -w "%{http_code}" -H "X-Script-Token: <新>" http://127.0.0.1
 
 | 日期 | 变更 |
 |---|---|
-| 2026-10-27 | 执行器改为计划任务托管 `serve.py`；新增 watchdog（实测 `RestartOnFailure` 无效）；清理旧守护进程相关文件；本文合并原 `OPERATIONS-executor.md` 与原说明书第 5 章 |
+| 2026-10-28 | 日志拆成 access / out / error 三份，内置按天轮转、保留 14 天（`serve.py:setup_logging()`）；新增离线验收 `deploy\verify-logging.py`；`ops-http.ps1 logs` 显示三份 + 归档 |
+| 2026-10-27 | 执行器改为计划任务托管 `serve.py`；新增 watchdog（实测 `RestartOnFailure` 无效）；清理旧守护进程相关文件；本文合并原运维 runbook 与原说明书第 5 章 |
+| 2026-10-28 | 文档与现架构对齐：删除旧架构安装/运维文档与配置备份，统一到 `INSTALL.md` / `MAINTENANCE.md` / `deploy\INSTALL-EXECUTOR.md` / `INSTALL-RECORD.md` |

@@ -153,10 +153,14 @@ C:\ScriptServer\                        ← 建议根目录（不要放 C:\Progr
 │  │  ├─ install-watchdog.ps1           ← 【管理员】单独注册/删除 watchdog
 │  │  ├─ watchdog.ps1                   ← 每分钟检查 9000，掉了就拉起主任务
 │  │  ├─ ops-http.ps1                   ← 日常运维（health/ready/tasks/logs/status/restart/drain）
-│  │  └─ verify-10.ps1                  ← 10 项验收
-│  └─ logs\                             ← 服务日志（serve.py 自动建）
-│     ├─ script-server-out.log
-│     ├─ script-server-error.log
+│  │  ├─ verify-10.ps1                  ← 10 项验收
+│  │  ├─ verify-logging.py              ← 日志分级/轮转离线验收
+│  │  ├─ INSTALL-EXECUTOR.md             ← 新设备部署步骤（简版）
+│  │  └─ register-autostart-task.ps1     ← 备用：单独注册自启任务（install.bat 之外）
+│  └─ logs\                             ← 服务日志（serve.py 自动建，按天轮转保留 14 天）
+│     ├─ script-server-out.log          ← 业务 INFO+
+│     ├─ script-server-error.log        ← 仅 ERROR+
+│     ├─ script-server-access.log       ← 每请求一行
 │     └─ watchdog.log
 ├─ scripts\                             ← 业务脚本目录（WF_SCRIPTS_DIR 指这里）
 │  ├─ hello.py
@@ -438,7 +442,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
 | 身份 | 当前用户 `S4U` + `Highest` | 同左 |
 | 动作 | `python.exe "…\deploy\serve.py"` | `powershell -File …\deploy\watchdog.ps1` |
 | 作用 | 托管服务本体（进程 = uvicorn） | 9000 无 listener 时 `Start-ScheduledTask` 主任务 |
-| 日志 | `logs\script-server-out.log` / `-error.log` | `logs\watchdog.log` |
+| 日志 | `logs\script-server-{out,error,access}.log`（按天轮转，保留 14 天） | `logs\watchdog.log` |
 
 **为什么必须有 watchdog（实测，2026-10-27）**：计划任务的 `RestartOnFailure` 在本环境**不生效**——
 外部杀进程（`LastTaskResult=0xFFFFFFFF`）或动作进程非零退出（`LastTaskResult=7`）后，任务都停在

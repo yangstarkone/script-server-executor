@@ -1,6 +1,6 @@
 @echo off
 rem ==========================================================================
-rem  Register the script-server autostart scheduled task (no PM2).
+rem  Register the script-server autostart scheduled task (no external daemon).
 rem
 rem  Double-click this file: it re-launches elevated (UAC) and runs
 rem  deploy\register-autostart-task.ps1. Full output: C:\ScriptServer\logs\register-task.log

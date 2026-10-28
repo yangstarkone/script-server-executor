@@ -2,51 +2,86 @@
 
 > 本文件是项目的跨会话记忆，供人和 AI agent 共用。
 > **读法**：只读「当前状态」+「待确认问题」+ 最近 3 条日志，不要通读全文。
-> **详细安装/运维记录**：`script-server\INSTALL-RECORD.md`（按设备分节，第 10 节 = 本机）。
+> **详细安装/运维记录**：`script-server\INSTALL-RECORD.md`（按设备记录，§2 = 本机）。
 
 ## 当前状态
 
 - 目标：在 `C:\ScriptServer` 运行 standalone script-server 执行器（FastAPI/uvicorn，VERSION 3.2.0），供平台「设备管理」派发脚本。
 - 本机：`YANGSTARONE` / `192.168.1.220` / 账户 `Administrator`；包从旧机 `WUYUAN`（192.168.1.222）整体拷贝而来。
-- 运行方式：**不用 PM2**；Windows 计划任务 `WorkflowPlatform-ScriptServer`（AtStartup / S4U / Highest）直接托管 `python deploy\serve.py`（uvicorn 单 worker，`0.0.0.0:9000`），另有 1 分钟看护任务 `WorkflowPlatform-ScriptServer-Watchdog`。
-- 现状（2026-10-27 17:41 用 `install.bat` 重装后）：主任务 Running，`/health` 200，`verify-10.ps1` **10/10 PASS**；动作已指向真实解释器 `...\Python312\python.exe`。
-- 能跑通：`deploy\verify-10.ps1` 10/10（2026-10-27 重装后实测；2026-10-26 亦两次通过，Stop/Start 冷启动等价测试通过）。
+- 运行方式：Windows 计划任务 `WorkflowPlatform-ScriptServer`（AtStartup / S4U / Highest）直接托管 `python deploy\serve.py`（uvicorn 单 worker，`0.0.0.0:9000`），另有 1 分钟看护任务 `WorkflowPlatform-ScriptServer-Watchdog`。
+- 现状（2026-10-28 09:37 为应用日志改造重启后，pid 25888）：主任务 Running，`/health` 200，`verify-10.ps1` **10/10 PASS**；动作指向真实解释器 `...\Python312\python.exe`；日志已拆成 access/out/error 三份并按天轮转、保留 14 天。
+- 能跑通：`deploy\verify-10.ps1` 10/10（2026-10-28 09:37、2026-10-27 重装后、2026-10-26 均通过）；`deploy\verify-logging.py` 14/14（日志分级/轮转离线验收）。
 - 不能跑通：无。
-- 未验证：**真实重启后的开机自启**（未重启本机）；平台侧「设备管理」登记与「检测」在线（需在平台操作）。
-- 已知问题：当前网络位置=公用配置文件且**防火墙关闭**（域配置文件为开启），未加 9000 放行规则；PM2 已于 2026-10-27 17:46 完全卸载（daemon/模块/命令/`~\.pm2` 全清，无自启项）；DSH 沙箱里 `Get-NetTCPConnection`/`Get-ScheduledTask`/`Get-CimInstance`/`Get-Process` 均不可信（会隐藏 node 进程、CIM 被拒），端口/任务/进程状态必须用提权脚本或 `/health` 判断。
-- 环境事实：`E:\workflow-scripts-center` **存在**（约 1.7 万文件，2026-10-26 同步），`.env` 的 `WF_ALLOWED_SCRIPT_ROOTS` 白名单有效；本机 `node.exe` 进程属于 WorkBuddy、紫鸟等其它软件，不是执行器/PM2。
-- 下一步：① 真实重启一次并按 `INSTALL-RECORD.md` §6 清单核对；② 平台登记 `base_url=http://192.168.1.220:9000` + `.env` 的 token；③ 需要的话启用防火墙并只放行平台 IP/网段。
+- 已验证：**真实重启开机自启 ✅**（系统 2026-10-28 09:01:55 启动，09:02:12 `serve.py` 自启，无人登录干预）；**平台设备登记 ✅**（192.168.1.210 每 60s 调 `/health/ready` 返回 200）。
+- 未验证：跨午夜的真实日志轮转（需等 2026-10-29 00:00 后看是否出现 `script-server-*.log.2026-10-28`）；14 份淘汰需 15 天观察。
+- 已知问题：当前网络位置=公用配置文件且**防火墙关闭**（域配置文件为开启），未加 9000 放行规则；DSH 沙箱里 `Get-NetTCPConnection`/`Get-ScheduledTask`/`Get-CimInstance`/`Get-Process` 均不可信（会隐藏进程或直接拒绝），端口/任务/进程状态必须用提权脚本或 `/health` 判断。
+- 环境事实：`E:\workflow-scripts-center` **存在**（约 1.7 万文件，2026-10-26 同步），`.env` 的 `WF_ALLOWED_SCRIPT_ROOTS` 白名单有效；本机 `node.exe` 进程属于 WorkBuddy、紫鸟等其它软件，不是执行器。
+- 下一步：① 2026-10-29 00:00 后确认首次跨天轮转产生归档；② 需要的话启用防火墙并只放行平台 IP/网段；③ 按测评 P0 项加固（降权 / 幂等指纹 / argv 脱敏，见待确认问题）。
+- 文档（2026-10-28 清理后）：`INSTALL.md`（安装+使用）、`MAINTENANCE.md`（运维）、`deploy\INSTALL-EXECUTOR.md`（新设备）、`INSTALL-RECORD.md`（本机安装记录）、`EXECUTOR-EVAL-20261027.md`（测评）；旧架构配置/文档已删除，仓库内已无相关引用。
 - 版本管理：GitHub 私有仓库 `script-server-executor`（main；`.env`、`logs/`、`.script_server_state/` 不入库）。
-- 最后更新：2026-10-27
+- 测评（2026-10-27 18:40，详见 `script-server\EXECUTOR-EVAL-20261027.md`）：作为内网单机执行器 **7.0/10（合格）**；30 项黑盒探针实测 33/36 通过（3 项 FAIL：幂等缓存陈旧、args 空引号丢失、未知字段静默忽略）。主要风险：token=管理员级 RCE 且明文 HTTP 无审计；零自动化测试；文档曾与现架构漂移（2026-10-28 已清理）。日志 P1-3 已于 2026-10-28 修复。
+- 最后更新：2026-10-28
 
 ## 待确认问题
 
-- 平台「设备管理」是否已登记本机（`base_url=http://192.168.1.220:9000` + `.env` 的 token）？未登记前平台侧「检测」不会在线。
 - 是否保留与旧机相同的 `WF_SCRIPT_TOKEN`？（沿用拷贝值即可让平台用同一 token 登记本机，若要求每台一 token 需同步改平台）
+- 是否继续做测评的其余 P0/P1 项：执行器降权到低权限账户 + 脚本目录 ACL、幂等指纹加脚本哈希、日志不落完整 argv、API 严格化（extra=forbid / 429 Retry-After）？降权要改计划任务账户与 ACL，属系统级改动，需确认后再动。
 
 ---
 
 ## 日志（新→旧）
 
-### 2026-10-27 卸载 PM2（全局包 + daemon + 数据目录）
+### 2026-10-28 文档与现架构对齐（P1-5）+ 清理旧架构记录
 
-- 背景：PM2 属旧架构遗留；执行器已改计划任务托管，PM2 只剩残留。
-- 发现：PM2 **daemon 实际在运行**（pid 26412，`C:\nvm4w\nodejs\node.exe ...\npm\node_modules\pm2\lib\Daemon.js`）。普通 shell 看不到 node.exe（DSH 沙箱隐藏进程），只有提权脚本的 `Win32_Process` 才能发现——之前"daemon 未运行"的判断是错的，已纠正。
-- 做法（UAC 提权脚本）：`taskkill /F /T /PID 26412` → 删除 `~\.pm2` → 删除 `...\npm\node_modules\pm2` 与 11 个 `pm2*` shim（等价 `npm uninstall -g pm2`，不依赖 npm）。第一次尝试在 `npm ls` 后异常中断、未改动系统，第二次用直接删除完成。
-- 结果：`where pm2` 无结果、`Get-Command pm2` 为 0、`npm ls -g` 不再含 pm2；无 pm2 计划任务/服务/Run 键；`~\.pm2` 已不存在。执行器 `/health` 200、任务 Running（进程未重启，uptime 连续）。
-- 未动：node/npm、其它全局包（dsh/ziniao-cli/pnpm/windows-build-tools）、仓库里的 `ecosystem.config.js` 与 `start-script-server.bat.pm2-bak`（仅回退参考）。
-- 证据：`logs\pm2-uninstall-report2.log`、`logs\pm2-uninstall-transcript.log`。
+- 目标：修测评 P1-5（文档与现架构漂移），并按用户要求删除旧架构（进程守护时代）相关记录。
+- 删（5 个文件，`git status` 中为 D）：`script-server/ecosystem.config.js`（旧守护配置）、
+  `script-server/start-script-server.bat` 的历史备份文件、`deploy/install-autostart.ps1`（旧守护版自启安装器）、
+  `SCRIPT-SERVER-新设备安装与使用说明.md`（1128 行旧说明书，内容已被 `INSTALL.md` 覆盖）、
+  `deploy/OPERATIONS-executor.md`（旧运维 runbook，已被 `MAINTENANCE.md` 覆盖）。
+- 重写：`deploy/INSTALL-EXECUTOR.md` 改为当前架构（只要 Python、`install.bat` 一键装、计划任务 + watchdog、
+  三份日志与轮转、真实重启验收、防火墙/卸载）；`INSTALL-RECORD.md` 改为"按设备记录"，
+  只保留本机（YANGSTARONE）的环境/安装/验收/坑/日志改造/证据，旧机与旧架构章节不再保留。
+- 清理措辞：`serve.py`、`MAINTENANCE.md`、`register-autostart-task.ps1`、`install-autostart-uvicorn.bat` 中
+  指向旧守护组件的说明文字；`INSTALL.md` 目录树/任务表已同步当前文件清单。
+- 验证：全仓库（排除 `.git`/`logs`）旧守护组件名引用 **0 处**；`serve.py`/`verify-logging.py` 通过 `py_compile`；
+  所有 `.ps1` 通过 PowerShell 语法解析；服务 `/health` 200、主任务 Running；`verify-10.ps1` 10/10。
+- 说明：旧配置与旧文档仍可在 git 历史中追溯（本轮为删除而非改写历史）。
 
-### 2026-10-27 用新安装器重装执行器（install.bat，替换旧 PM2 时代安装）
+### 2026-10-28 日志拆分 access/out/error + 每日轮转保留 14 天
 
-- 目标：按更新后的 `INSTALL.md` 重装执行器，替换旧（PM2 时代）安装。
+- 目标：修测评 P1-3（日志混在一起、无轮转）。旧 `script-server-error.log` 实测量化：41,737 B / 393 行，其中 **ERROR 0 条**、access 207 条、WARNING 14 条 → “错误日志里没有错误”。
+- 改（`deploy\serve.py`）：新增 `setup_logging()`（`TimedRotatingFileHandler`，`when=midnight`、`backupCount=14`、UTF-8）：
+  `script-server-access.log`（挂 `uvicorn.access`、`propagate=False`，每请求一行）、
+  `script-server-out.log`（root，INFO+，含 ERROR 副本）、`script-server-error.log`（root，仅 ERROR+）；
+  去掉原来的 stdout/stderr 重定向（启动行改为 logger 输出）；日志目录不可写时降级 stderr 且不阻止启动。
+  同步改 `ops-http.ps1 logs`（显示三份 + 最近 5 个归档）；新增离线验收 `deploy\verify-logging.py`。
+- 验收（离线）：`python deploy\verify-logging.py` **14/14 PASS**（分级、中文 UTF-8、默认 MIDNIGHT/14、`when='S'` 模拟轮转与保留淘汰）。
+- 应用：提权 `Start-Process -Verb RunAs` 跑 `logs\apply-logging.ps1`（先建 `.maintenance` 暂停 watchdog → Stop/Start 计划任务 → 等 `/health` 200 → 删标记 → `verify-10.ps1`）。重启后新 pid 25888，`/health` 200（约 3s），`verify-10.ps1` **10/10 PASS**。
+- 线上验证：access.log 只含 `uvicorn.access`；out.log 有 `[serve] start`、任务启动/完成、超时 WARNING；error.log 自 09:37:31 起 **0 行新增**（mtime 停在 09:37:21）。
+- 顺带确认：① **真实重启自启已验证**（系统 2026-10-28 09:01:55 启动、09:02:12 `serve.py` 自启，out.log 有 `[serve] start pid=5100`）；② **平台设备登记已生效**（192.168.1.210 每 60s 探 `/health/ready` 200）。
+- 未验证：跨午夜真实轮转（等 10-29 00:00 后确认 `script-server-*.log.2026-10-28` 出现）；14 份淘汰需 15 天。
+- 证据：`logs\apply-logging-20261028.log`、`script-server\deploy\verify-logging.py`、`script-server\logs\verify-result.json`。文档同步：`MAINTENANCE.md` §5/§11、`INSTALL.md`、`deploy\INSTALL-EXECUTOR.md`、`INSTALL-RECORD.md` §2.8、`PROJECT_LOG.md`。
+
+### 2026-10-27 执行器测评（代码走读 + 36 项黑盒探针）
+
+- 目标：把执行器当“脚本执行器”做一次实测评测，不只看代码也不只看健康检查。
+- 方法：`script_server.py` 1584 行全文走读 + `serve.py` + `verify-10.ps1`；黑盒探针 3 个脚本（`logs\eval-probe{,2,3}.py`，31+ 项，含并发/取消/超时/大输出/GBK/路径逃逸），结果落 `logs\eval-extra*.json`；主机 16 逻辑核、Python 3.12.10、fastapi 0.119.1 / uvicorn 0.49.0。
+- 结论：**7.0/10，内网单机合格**。功能完整 9.0、可靠性 7.5、性能 7.5（p50 49ms、4 并发真并行 2.34s）、安全 5.5、可观测 6.5、可维护 4.5。报告 `script-server\EXECUTOR-EVAL-20261027.md`（未提交 git）。
+- 实测通过的关键行为：无/错 token 均 401；相对逃逸/目录外绝对路径/非法扩展名/`/scan` 越界全部 403；5 并发→4×200+1×429；4×`sleep(2)` 墙钟 2.34s；`/cancel` 0.18s 生效；9MB 输出截断到 8MB 不炸；GBK 输出正确还原；exit1=部分成功、Traceback=脚本错误；token 不落日志。
+- 实测 FAIL / 注意：① 脚本内容改了、同 `task_run_id` 重投仍返回旧结果（fingerprint 不含文件内容/mtime）；② `args='a "" b'` 丢空参数；③ 未知字段（如 `{"timeout":1}`）静默忽略，仍按默认 300s 跑；④ 429 无 `Retry-After`；⑤ 完整 argv 进日志（敏感参数会泄漏）；⑥ `script-server-error.log` 里全是 INFO/access 日志（uvicorn 走 stderr），`out.log` 只有启动行，且无轮转。
+- 代码事实（未构造实测）：单 worker 单点、`kill_failed` 会永久占一个并发槽直到重启、无任务队列、依赖未锁定（`uvicorn>=0.30`）、文档曾与现架构漂移（2026-10-28 已清理）、引用的 `EXECUTOR-STABILITY-EVAL-20261023.md`/`FIX-P1-20261026.md` 不在仓库。
+- 遗留：P0 加固（执行器降权到低权限账户 + 脚本目录 ACL、幂等指纹加脚本哈希、日志分级轮转）尚未做；探针脚本未转成 pytest。
+
+### 2026-10-27 用新安装器重装执行器（install.bat，替换旧架构安装）
+
+- 目标：按更新后的 `INSTALL.md` 重装执行器，替换旧架构安装。
 - 预检：Python 3.12.10 + fastapi 0.119.1 / uvicorn 0.49.0 满足 `requirements.txt`；`.env` 沿用（token 未换）；旧计划任务仍在 Running（pid 4148，旧版 `serve.py`）；当前 shell 非管理员。
 - 改（代码）：`deploy\cutover-to-uvicorn-task.ps1` 新增 `Find-Python`——优先固定候选路径找真实解释器，规避 `python` 解析到 `WindowsApps\python.exe`（0 字节 Store 存根；本机 machine PATH 中存根排在真实 Python 前）。不修的话任务会被注册成存根，永远起不来。
 - 安装：`install.bat -nopause` 经 UAC 提权 → `cutover-to-uvicorn-task.ps1`：结束旧 pid 4148 → 注册主任务（真实 python + `serve.py`，Boot/S4U/Highest）→ 注册 watchdog → 启动；17:41:42 完成。
-- 验收：`verify-10.ps1` **10/10 PASS**（含真实执行、幂等、超时、路径逃逸）；主任务 Running、watchdog Ready；`/health` 200 / `auth_required=true` / `concurrency=4`。node.exe 数安装前后均 5（DSH 等其它软件；PM2 daemon 未运行、`pm2.pid` 陈旧、无 PM2 自启任务/Run 键）。
+- 验收：`verify-10.ps1` **10/10 PASS**（含真实执行、幂等、超时、路径逃逸）；主任务 Running、watchdog Ready；`/health` 200 / `auth_required=true` / `concurrency=4`。node.exe 数安装前后均 5（属 DSH 等其它软件，不是执行器）。
 - 证据：`C:\ScriptServer\logs\reinstall-report.log`（提权安装全过程）、`logs\cutover.log`、`script-server\logs\verify-result.json`。
 - 坑：① DSH 沙箱里 `Get-NetTCPConnection`（CIM）、`Get-ScheduledTask`、`tasklist` 均被拒 → 会把"服务在跑"误判成"未监听"，端口/任务状态必须用提权脚本或 `/health` 判断；② 新 `cutover` 原用 `Get-Command python`，本机会注册成 Store 存根（已修）。
-- 遗留：真实重启自启未验证；平台设备登记/检测未做；防火墙规则未加（当前公用配置文件关闭，跨机可达）；`~\.pm2` 残留未清理。
+- 遗留：真实重启自启未验证；平台设备登记/检测未做；防火墙规则未加（当前公用配置文件关闭，跨机可达）。
 
 ### 2026-10-27 初始化 Git 与 GitHub 私有仓库（安装前留档）
 
@@ -55,12 +90,12 @@
 - 改：新增 `.gitignore`（排除 `.env`、`logs/`、`.script_server_state/`、`__pycache__/`、`*.log`）与 `README.md`；`script-server/INSTALL-RECORD.md` 第 47 行真实 token 改为占位符；`git init -b main`，仓库内身份 `yangstarkone <yangstarkone@users.noreply.github.com>`。
 - 敏感信息检查：独立只读审计 PASS——索引内无凭据（真实 token 零命中、无硬编码默认 token），远端树无 `.env`/日志/状态目录；文档保留内网 IP、主机名、`Administrator` 等 LOW 信息（仓库 private，暂不处理）。
 - 坑：① Git for Windows 走 schannel 访问 GitHub 报 `SEC_E_NO_CREDENTIALS`；② credential helper `!gh auth git-credential` 在 DSH 受限环境起不了 sh（signal pipe Win32 5）。可行推送法：`http.sslBackend=openssl` + 用 `GIT_CONFIG_*` 环境变量注入 `http.extraHeader="Authorization: Basic base64(x-access-token:<gh token>)"`，token 不进 argv、不落盘。
-- 遗留：未加 gitleaks/secret scanning；`script-server/start-script-server.bat.pm2-bak` 作为历史备份一并提交。
+- 遗留：未加 gitleaks/secret scanning。
 
-### 2026-10-26 在新机 YANGSTARONE 装好 script-server 执行器（无 PM2）
+### 2026-10-26 在新机 YANGSTARONE 装好 script-server 执行器
 
 - 目标：把旧机拷来的 `C:\ScriptServer` 在本机装成可开机自启的执行器。
-- 结论：走 `INSTALL-RECORD.md` §8.3 的"计划任务直接托管 uvicorn"模型；PM2 不参与。拷贝包缺的 `serve.py` / 注册脚本 / 验收脚本按 §8.3 描述重建（详见 `script-server\INSTALL-RECORD.md` §10）。
+- 结论：走 `INSTALL-RECORD.md` 的"计划任务直接托管 uvicorn"模型。拷贝包缺的 `serve.py` / 注册脚本 / 验收脚本按描述重建（详见 `script-server\INSTALL-RECORD.md`）。
 - 改：新增 `script-server\deploy\serve.py`、`deploy\register-autostart-task.ps1`、`deploy\install-autostart-uvicorn.bat`、`deploy\verify-10.ps1`；`script-server\INSTALL-RECORD.md` 追加第 10 节；登记计划任务 `WorkflowPlatform-ScriptServer`。
-- 坑：① 拷贝包里只有 PM2 时代 deploy 文件（无 serve.py），照 §9 装不起来 → 只能重建；② 在 DSH 受限 shell 里启动服务后 `/run` 必 500 `WinError 5`（asyncio 建子进程命名管道被拒），换计划任务托管即正常；③ `/scan` 的 `dir_path` 是 query 参数，传 JSON body 返回空列表；④ 拷来的 `.script_server_state\results` 会让同 `task_run_id` 在 24h 内命中旧机缓存（假成功）→ 已移走备份。
+- 坑：① 拷贝包里只有旧架构 deploy 文件（无 `serve.py`），照旧说明书装不起来 → 只能重建；② 在 DSH 受限 shell 里启动服务后 `/run` 必 500 `WinError 5`（asyncio 建子进程命名管道被拒），换计划任务托管即正常；③ `/scan` 的 `dir_path` 是 query 参数，传 JSON body 返回空列表；④ 拷来的 `.script_server_state\results` 会让同 `task_run_id` 在 24h 内命中旧机缓存（假成功）→ 已移走备份。
 - 遗留：真实重启自启未验证；防火墙规则与平台登记未做。
