@@ -2,7 +2,7 @@
 """日志分级/轮转的离线验收（不依赖运行中的服务，不需要 token）。
 
 检查：
-  1) 三份日志分开：access 只收 uvicorn.access、out 收 INFO+、error 只收 ERROR+；
+  1) 四份日志分开：access 只收 uvicorn.access、out 收 INFO+、error 只收 ERROR+、audit 只收审计；
   2) 中文按 UTF-8 写入且可读回；
   3) 生产默认是「按天轮转、保留 14 份」；
   4) 轮转与保留策略真的生效（用 when='S' 压缩时间验证）。
@@ -42,18 +42,20 @@ def _close_all() -> None:
     for h in list(root.handlers):
         root.removeHandler(h)
         h.close()
-    acc = logging.getLogger("uvicorn.access")
-    for h in list(acc.handlers):
-        acc.removeHandler(h)
-        h.close()
+    for name in ("uvicorn.access", "audit"):
+        lg = logging.getLogger(name)
+        for h in list(lg.handlers):
+            lg.removeHandler(h)
+            h.close()
 
 
 def test_split(tmp: Path) -> None:
     _close_all()
     ok = serve.setup_logging(tmp)
     check("setup_logging 返回 True", ok)
-    check("access/out/error 三个文件立即创建",
-          all((tmp / n).exists() for n in (serve.ACCESS_LOG, serve.SERVICE_LOG, serve.ERROR_LOG)))
+    check("access/out/error/audit 四个文件立即创建",
+          all((tmp / n).exists() for n in (serve.ACCESS_LOG, serve.SERVICE_LOG,
+                                           serve.ERROR_LOG, serve.AUDIT_LOG)))
 
     root = logging.getLogger()
     rot = [h for h in root.handlers if isinstance(h, TimedRotatingFileHandler)]
@@ -80,6 +82,18 @@ def test_split(tmp: Path) -> None:
     check("out.log 不含访问日志", "POST /run" not in service)
     check("error.log 只有 ERROR", "boom" in error and "任务 abc" not in error)
     check("中文 UTF-8 可读回", "任务 abc 完成，退出码: 0" in service)
+
+    logging.getLogger("audit").info('{"event":"run.finish","code":200}')
+    for h in logging.getLogger("audit").handlers:
+        h.flush()
+    audit_text = _read(tmp / serve.AUDIT_LOG)
+    service_after = _read(tmp / serve.SERVICE_LOG)
+    check("audit.log 只收审计行（JSON）",
+          '"event":"run.finish"' in audit_text and "run.finish" not in service_after,
+          repr(audit_text[:80]))
+    audit_logger = logging.getLogger("audit")
+    check("审计 handler 挂在 audit logger 且不向 root 传播",
+          len(audit_logger.handlers) == 1 and audit_logger.propagate is False)
 
 
 def test_rotation(tmp: Path) -> None:

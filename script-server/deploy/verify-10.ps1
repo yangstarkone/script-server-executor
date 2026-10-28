@@ -1,4 +1,4 @@
-﻿# script-server acceptance (10 checks per INSTALL.md ch.3)
+# script-server acceptance (10 checks per INSTALL.md ch.3)
 # ASCII-only source: PS 5.1 reads BOM-less files as ANSI, so no literal non-ASCII here.
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -38,7 +38,7 @@ Line 1 ([bool]$listen) ("LISTENING pid=" + (($listen | Select-Object -ExpandProp
 try {
     $r = Invoke-WebRequest -UseBasicParsing -Uri "$base/health" -TimeoutSec 10
     $j = Decode $r | ConvertFrom-Json
-    $ok = ($r.StatusCode -eq 200 -and $j.version -eq '3.2.0' -and $j.auth_required -eq $true -and $j.draining -eq $false)
+    $ok = ($r.StatusCode -eq 200 -and $j.version -eq '3.3.0' -and $j.auth_required -eq $true -and $j.draining -eq $false)
     Line 2 $ok ("HTTP " + $r.StatusCode + " version=" + $j.version + " auth_required=" + $j.auth_required + " draining=" + $j.draining)
 } catch { Line 2 $false $_.Exception.Message }
 

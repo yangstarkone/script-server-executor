@@ -6,7 +6,15 @@
   接收调度系统（Docker Worker / 平台）的 HTTP 请求，执行 Python 脚本并返回结果。
   支持取消正在运行的脚本（POST /cancel/{task_id}）。
   客户端断开时默认取消执行（可关闭，见 WF_CANCEL_ON_DISCONNECT）。
-  同一 task_run_id 只执行一次：已完成的结果有本地缓存，重投直接返回（幂等）。
+
+幂等与重试（2026-10-28 / 3.3.0）:
+  - 幂等键 = task_run_id（可选，调用方提供）；不传则每次都是新任务、不做任何去重。
+  - 命中条件 = 同一 task_run_id + 同一请求指纹。指纹含 脚本路径、args、env、超时、
+    **脚本内容 sha256** → 脚本改动后同一 task_run_id 会重新执行，不会返回旧结果。
+  - 只有**成功（exit 0）**的结果才落缓存；失败/超时/取消一律不缓存，
+    所以平台“失败工作流里的重试”会真正重跑，不会被幂等挡住。
+  - 同一 task_run_id 仍在运行 → 409 + Retry-After（通常是上一次响应丢了；等一会儿或查 /tasks）。
+  - 幂等真正防护的是“响应丢失但其实已成功”的重投：返回历史结果，绝不二次执行。
 
 启动:
   python deploy\\serve.py           （推荐；读 .env 并托管 uvicorn）
@@ -32,12 +40,16 @@
     "args": "--verbose",              // 可选，CLI 参数（Windows 下按“空格/双引号”切分，反斜杠原样保留）
     "env": {"KEY": "value"},          // 可选，注入为环境变量
     "timeout_seconds": 300,           // 可选，默认 300，范围 1-7200
-    "task_run_id": "xxx"              // 可选，幂等键 + 取消追踪
+    "task_run_id": "xxx",             // 可选，幂等键 + 取消追踪
+    "block_strategy": "reject"        // 可选，并发满时：reject=立即 429（默认） / queue=排队等空槽
   }
 
-响应 (200):
-  {task_id, exit_code, stdout, stderr, success, partial, status_label,
-   cancelled, deduplicated, truncated, duration_seconds}
+响应 (HTTP 200):
+  {task_id, code, exit_code, stdout, stderr, success, partial, status_label,
+   cancelled, timed_out, deduplicated, truncated, duration_seconds}
+  code 三态（平台判定用，与 exit_code 互补）:
+    200 = 成功；500 = 失败/取消/脚本内部错误；502 = 超时（进程已终止）
+  HTTP 层错误仍用状态码: 400 参数、401 鉴权、403 路径、409 同 task_id 运行中、429 繁忙、503 排空。
 
 取消 (POST /cancel/{task_id]):
   杀掉正在运行的脚本进程树（先 taskkill /F /T，失败再 kill 主进程）。
@@ -48,7 +60,8 @@
   - 缓存/台账只用于“同一 task_run_id 不重复执行”，不替代平台的任务状态机。
 
 稳定性相关环境变量:
-  WF_MAX_CONCURRENCY=4            并发执行上限，超出返回 429
+  WF_MAX_CONCURRENCY=4            并发执行上限，超出返回 429（带 Retry-After）
+  WF_QUEUE_MAX_WAIT_SECONDS=30    block_strategy=queue 时最多排队等待秒数（同时不超过本次 timeout）
   WF_MAX_OUTPUT_BYTES=8388608     单流 stdout/stderr 捕获上限（超出截断并置 truncated）
   WF_RESULT_CACHE_TTL=86400       已完成结果缓存秒数
   WF_RESULT_CACHE_MAX_FILES=2000  结果缓存文件数上限
@@ -93,10 +106,10 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 # ── 日志 ────────────────────────────────────────────
 logging.basicConfig(
@@ -104,8 +117,36 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+# 业务审计（一次运行一行 JSON）：由 deploy\serve.py 挂到 logs\script-server-audit.log
+audit_logger = logging.getLogger("audit")
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
+
+
+def _audit(event: str, **fields) -> None:
+    """写一行审计 JSON。审计失败绝不影响执行（吞掉异常）。"""
+    payload = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "event": event,
+        "pid": os.getpid(),
+    }
+    payload.update({k: v for k, v in fields.items() if v not in (None, "")})
+    try:
+        audit_logger.info(json.dumps(payload, ensure_ascii=False, default=str))
+    except Exception:
+        pass
+
+
+def _short_hash(text: str) -> str:
+    """参数摘要：审计里不落明文 argv（测评 P1：argv 泄漏），只留可对比的短哈希。"""
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _client_ip(request: Optional[Request]) -> str:
+    try:
+        return request.client.host if request is not None and request.client else ""
+    except Exception:
+        return ""
 
 
 def _env_int(name: str, default: int) -> int:
@@ -245,6 +286,7 @@ except OSError as _state_exc:  # 只读盘/权限问题：降级为无幂等模�
 
 # ── 资源上限 / 策略 ────────────────────────────────
 _MAX_CONCURRENCY = max(1, _env_int("WF_MAX_CONCURRENCY", 4))
+_QUEUE_MAX_WAIT = max(1, _env_int("WF_QUEUE_MAX_WAIT_SECONDS", 30))
 _MAX_OUTPUT_BYTES = max(64 * 1024, _env_int("WF_MAX_OUTPUT_BYTES", 8 * 1024 * 1024))
 _RESULT_CACHE_TTL = max(60, _env_int("WF_RESULT_CACHE_TTL", 24 * 3600))
 _RESULT_CACHE_MAX_FILES = max(10, _env_int("WF_RESULT_CACHE_MAX_FILES", 2000))
@@ -358,6 +400,7 @@ _METRICS = {
     "run_cancelled": 0,
     "run_kill_failed": 0,
     "rejected_busy": 0,
+    "queued": 0,
     "conflict_409": 0,
     "deduplicated": 0,
     "spawn_errors": 0,
@@ -633,11 +676,26 @@ async def _cache_put(task_id: str, response: dict, fingerprint: str) -> None:
         logger.warning("写结果缓存失败（task_id=%s）: %s", task_id, exc)
 
 
-def _request_fingerprint(req: "RunRequest") -> str:
-    """请求指纹：同 task_id 但 file_path/args/env/timeout 变了就不能复用旧结果。"""
+def _file_signature(path: Path) -> dict:
+    """脚本内容指纹：脚本改过之后，同一 task_run_id 不能复用旧结果（修测评「幂等缓存陈旧」）。"""
+    try:
+        st = path.stat()
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(256 * 1024), b""):
+                digest.update(chunk)
+        return {"sha256": digest.hexdigest(), "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    except OSError as exc:
+        logger.warning("计算脚本内容指纹失败（%s）: %s", path, exc)
+        return {"sha256": "", "size": 0, "mtime_ns": 0}
+
+
+def _request_fingerprint(req: "RunRequest", script_path: Path, script_sig: dict) -> str:
+    """请求指纹：同 task_run_id 但脚本内容/路径/args/env/超时变了就不能复用旧结果。"""
     payload = json.dumps(
         {
-            "file_path": req.file_path,
+            "file_path": str(script_path),
+            "script": script_sig,
             "args": req.args,
             "env": dict(sorted((req.env or {}).items())),
             "timeout_seconds": req.timeout_seconds,
@@ -651,11 +709,15 @@ def _request_fingerprint(req: "RunRequest") -> str:
 # ── 模型 ────────────────────────────────────────────
 
 class RunRequest(BaseModel):
+    # 允许未知字段（旧/新平台可能多传），但不静默忽略：/run 里会打 WARNING 列出字段名
+    model_config = ConfigDict(extra="allow")
+
     file_path: str
     args: str = ""
     env: dict[str, str] = {}
     timeout_seconds: int = 300
     task_run_id: str = ""  # 可选的任务ID，用于取消追踪与幂等
+    block_strategy: Literal["reject", "queue"] = "reject"  # 并发满时的处理策略
 
     @field_validator("timeout_seconds")
     @classmethod
@@ -667,6 +729,7 @@ class RunRequest(BaseModel):
 
 class RunResponse(BaseModel):
     task_id: str
+    code: int = 200          # 200 成功 / 500 失败 / 502 超时（平台判定用；与 exit_code 互补）
     exit_code: int
     stdout: str
     stderr: str
@@ -674,9 +737,28 @@ class RunResponse(BaseModel):
     partial: bool = False
     status_label: str
     cancelled: bool = False
+    timed_out: bool = False
     deduplicated: bool = False
     truncated: bool = False
     duration_seconds: float = 0.0
+
+
+def _audit_finish(response: "RunResponse", **fields) -> None:
+    """一次运行结束的审计行（成功/失败/超时/取消统一形状，便于日志检索与对账）。"""
+    _audit(
+        "run.finish",
+        run_id=response.task_id,
+        code=response.code,
+        exit_code=response.exit_code,
+        status=response.status_label,
+        success=response.success,
+        partial=response.partial,
+        cancelled=response.cancelled,
+        timed_out=response.timed_out,
+        truncated=response.truncated,
+        duration_ms=round(response.duration_seconds * 1000, 1),
+        **fields,
+    )
 
 
 # ── 辅助 ────────────────────────────────────────────
@@ -1211,33 +1293,26 @@ async def scan_directory(dir_path: str = ""):
 @app.post("/run", response_model=RunResponse, dependencies=[Depends(require_token)])
 async def run(req: RunRequest, request: Request = None):
     _bump("requests")
+    client_ip = _client_ip(request)
     if _DRAINING:
         _bump("drain_rejected")
+        _audit("run.reject", reason="draining", client=client_ip,
+               run_id=(req.task_run_id or "").strip(), script=Path(req.file_path or "").name)
         raise HTTPException(
             503,
             "执行器正在排空（升级/重启中），请稍后重试",
             headers={"Retry-After": "10"},
         )
+    extra_fields = sorted((req.model_extra or {}).keys())
+    if extra_fields:
+        logger.warning("POST /run 收到未识别字段（已忽略）: %s", ", ".join(extra_fields))
     task_id = _get_task_id(req)
     explicit_id = bool((req.task_run_id or "").strip())
     started_monotonic = time.monotonic()
     started_wall = time.time()
+    args_sha = _short_hash(req.args or "")
 
-    # 1) 幂等：已完成的成功结果直接返回（响应丢失/重投/重启后重派都不会二次执行）
-    request_fingerprint = _request_fingerprint(req)
-    if explicit_id:
-        cached = await _cache_get(task_id, request_fingerprint)
-        if cached:
-            _bump("deduplicated")
-            logger.info("任务 %s 命中幂等缓存，直接返回历史结果", task_id)
-            try:
-                cached = {**cached, "deduplicated": True}
-                cached.setdefault("duration_seconds", 0.0)
-                return RunResponse(**cached)
-            except Exception as exc:
-                logger.warning("缓存结果损坏，忽略并重新执行（task=%s）: %s", task_id, exc)
-
-    # 2) 参数/路径校验（快速失败，不占用并发槽）
+    # 1) 参数/路径校验（快速失败，不占用并发槽；先于幂等查询，避免缓存绕过校验）
     try:
         script_path = _resolve_path(req.file_path)
     except HTTPException:
@@ -1255,16 +1330,57 @@ async def run(req: RunRequest, request: Request = None):
     if sum(len(k) + len(v) for k, v in env_extra.items()) > 65536:
         raise HTTPException(413, "env 过大（>64KB）")
     env_extra = _sanitize_env_extra(env_extra)
+    script_sig = _file_signature(script_path)
+    script_sha = script_sig["sha256"][:16]
 
-    # 3) 并发槽（超过上限快速 429，保护宿主）
-    if not _try_acquire_slot():
+    # 2) 幂等：同一 task_run_id + 同一指纹的**成功**结果直接返回（失败不缓存，重试会真跑）
+    request_fingerprint = _request_fingerprint(req, script_path, script_sig) if explicit_id else ""
+    if explicit_id:
+        cached = await _cache_get(task_id, request_fingerprint)
+        if cached:
+            _bump("deduplicated")
+            logger.info("任务 %s 命中幂等缓存，直接返回历史结果", task_id)
+            try:
+                cached = {**cached, "deduplicated": True}
+                cached.setdefault("code", 200)
+                cached.setdefault("duration_seconds", 0.0)
+                cached.setdefault("timed_out", False)
+                response = RunResponse(**cached)
+                _audit("run.dedup", run_id=task_id, client=client_ip, script=script_path.name,
+                       script_sha=script_sha, args_sha=args_sha, code=response.code,
+                       exit_code=response.exit_code, status=response.status_label)
+                return response
+            except Exception as exc:
+                logger.warning("缓存结果损坏，忽略并重新执行（task=%s）: %s", task_id, exc)
+
+    # 3) 并发槽：reject=立即 429（带 Retry-After）；queue=排队等空槽，最多 WF_QUEUE_MAX_WAIT 秒
+    queue_started = time.monotonic()
+    got_slot = _try_acquire_slot()
+    if not got_slot and req.block_strategy == "queue":
+        deadline = queue_started + min(_QUEUE_MAX_WAIT, float(req.timeout_seconds))
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            if _try_acquire_slot():
+                got_slot = True
+                break
+    queue_wait = time.monotonic() - queue_started
+    if not got_slot:
         _bump("rejected_busy")
-        raise HTTPException(429, f"执行机繁忙（并发上限 {_MAX_CONCURRENCY}），请稍后重试")
+        _audit("run.reject", reason="busy", client=client_ip, run_id=task_id,
+               explicit=explicit_id, script=script_path.name, block_strategy=req.block_strategy,
+               queue_wait_ms=round(queue_wait * 1000, 1))
+        raise HTTPException(
+            429,
+            f"执行机繁忙（并发上限 {_MAX_CONCURRENCY}），请稍后重试",
+            headers={"Retry-After": "5"},
+        )
+    if queue_wait > 0.1:
+        _bump("queued")
 
     handle: Optional[_TaskHandle] = None
     keep_handle = False
     try:
-        # 4) 同 task_id 运行中 -> 409（检查与登记之间无 await，单 event loop 内原子）
+        # 4) 同 task_id 运行中 -> 409 + Retry-After（检查与登记之间无 await，单 event loop 内原子）
         _prune_finished_handles()
         with _state_lock:
             existing = task_manager.get(task_id)
@@ -1273,7 +1389,11 @@ async def run(req: RunRequest, request: Request = None):
                 # 否则同 task_id 会在收尾窗口内被执行第二次（复审 N5）。
                 _bump("conflict_409")
                 pid = existing.process.pid if existing.process is not None else None
-                raise HTTPException(409, f"任务 {task_id} 已在运行中（pid={pid}）")
+                raise HTTPException(
+                    409,
+                    f"任务 {task_id} 已在运行中（pid={pid}）；请等待或改用新的 task_run_id",
+                    headers={"Retry-After": "5"},
+                )
             handle = _TaskHandle(
                 task_id=task_id,
                 script_path=script_path,
@@ -1285,6 +1405,10 @@ async def run(req: RunRequest, request: Request = None):
             task_manager[task_id] = handle
             handle.slot_held = True
         await _persist_running()
+        _audit("run.start", run_id=task_id, explicit=explicit_id, client=client_ip,
+               script=script_path.name, script_sha=script_sha, args_len=len(req.args or ""),
+               args_sha=args_sha, env_keys=sorted(env_extra), timeout_s=req.timeout_seconds,
+               block_strategy=req.block_strategy, queue_wait_ms=round(queue_wait * 1000, 1))
 
         # 5) 子进程环境
         # 修复 P1-1：请求 env 已在 _sanitize_env_extra 里拒绝危险键；这里再做兜底剥离，
@@ -1297,7 +1421,9 @@ async def run(req: RunRequest, request: Request = None):
         env.setdefault("PYTHONUNBUFFERED", "1")
         cwd = str(script_path.parent)
 
-        logger.info("启动任务 %s: %s", task_id, " ".join(handle.cmd))
+        # 日志只记脚本名 + 参数摘要（不再落明文 argv，测评 P1；完整参数见审计 args_sha 对照）
+        logger.info("启动任务 %s: %s args_len=%d args_sha=%s", task_id, script_path.name,
+                    len(req.args or ""), args_sha)
         kwargs = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # 0x08000000
@@ -1321,6 +1447,7 @@ async def run(req: RunRequest, request: Request = None):
             _bump("run_cancelled")
             response = RunResponse(
                 task_id=task_id,
+                code=500,
                 exit_code=-1,
                 stdout="",
                 stderr="任务在启动阶段被取消",
@@ -1329,6 +1456,8 @@ async def run(req: RunRequest, request: Request = None):
                 cancelled=True,
                 duration_seconds=round(time.monotonic() - started_monotonic, 3),
             )
+            _audit_finish(response, client=client_ip, script=script_path.name,
+                          script_sha=script_sha, args_sha=args_sha, phase="spawn")
             return response
 
         # 7) 并发读取两路输出（有上限），等待“退出 / 取消 / 超时”任一发生
@@ -1393,6 +1522,7 @@ async def run(req: RunRequest, request: Request = None):
             logger.info("任务 %s 完成，退出码: %s", task_id, returncode)
             response = RunResponse(
                 task_id=task_id,
+                code=200 if is_success else 500,
                 exit_code=returncode,
                 stdout=stdout_text,
                 stderr=stderr_text,
@@ -1420,11 +1550,13 @@ async def run(req: RunRequest, request: Request = None):
                 timeout_msg += "\n" + stderr_text
             response = RunResponse(
                 task_id=task_id,
+                code=502,
                 exit_code=-1,
                 stdout=stdout_text,
                 stderr=timeout_msg,
                 success=False,
                 status_label=_KILL_FAILED_LABEL if not kill_ok else "脚本超时",
+                timed_out=True,
                 truncated=truncated,
                 duration_seconds=round(time.monotonic() - started_monotonic, 3),
             )
@@ -1446,6 +1578,7 @@ async def run(req: RunRequest, request: Request = None):
                 message += "\n" + stderr_text
             response = RunResponse(
                 task_id=task_id,
+                code=500,
                 exit_code=-1,
                 stdout=stdout_text,
                 stderr=message,
@@ -1458,6 +1591,8 @@ async def run(req: RunRequest, request: Request = None):
             logger.info("任务 %s 已取消（%s），kill_ok=%s", task_id, reason_text, kill_ok)
             keep_handle = not kill_ok
 
+        _audit_finish(response, client=client_ip, script=script_path.name, script_sha=script_sha,
+                      args_sha=args_sha, kill_failed=(not kill_ok if reason != "exited" else False))
         return response
 
     except HTTPException:
@@ -1481,6 +1616,7 @@ async def run(req: RunRequest, request: Request = None):
         for _task in list(locals().get("readers") or []) + [locals().get("wait_task")]:
             if _task is not None and not _task.done():
                 _task.cancel()
+        _audit("run.abort", run_id=task_id, phase="interrupted", error=type(exc).__name__)
         raise
     except Exception:
         _bump("spawn_errors")
@@ -1495,8 +1631,9 @@ async def run(req: RunRequest, request: Request = None):
                 keep_handle = True
                 _bump("kill_failed")
                 logger.error("任务 %s 异常且进程终止失败：保留台账与并发槽", task_id)
-        return RunResponse(
+        response = RunResponse(
             task_id=task_id,
+            code=500,
             exit_code=3,
             stdout="",
             stderr=traceback.format_exc(),
@@ -1504,6 +1641,9 @@ async def run(req: RunRequest, request: Request = None):
             status_label="脚本错误",
             duration_seconds=round(time.monotonic() - started_monotonic, 3),
         )
+        _audit_finish(response, client=client_ip, script=script_path.name, script_sha=script_sha,
+                      args_sha=args_sha, error="exception")
+        return response
     finally:
         if handle is not None:
             # 进程确认终止（或本来就没起来）才算 done；kill 失败时保持“运行中”，
@@ -1538,6 +1678,7 @@ async def cancel_task(task_id: str):
         raise HTTPException(400, f"任务已完成: {task_id}")
 
     logger.info("收到取消请求: %s", task_id)
+    _audit("run.cancel", run_id=task_id, phase="spawn" if process is None else "running")
     handle.request_cancel("user_cancel")
     if process is None:
         # 还在 spawn 阶段：/run 协程会在 spawn 后看到 cancel_event 并清理

@@ -7,10 +7,11 @@
 做的事：
   1) 读取同目录上一级的 .env（已存在的环境变量优先，便于临时覆盖）；
   2) 设定 WF_BIND_HOST / PYTHONIOENCODING（不设 PYTHONUTF8，避免改变业务脚本 open() 编码）；
-  3) 日志拆成三份并**按天轮转、保留 14 天**（不依赖任何外部轮转工具）：
+  3) 日志拆成四份并**按天轮转、保留 14 天**（不依赖任何外部轮转工具）：
        logs\\script-server-access.log  访问日志（一次 HTTP 请求一行）
        logs\\script-server-out.log     服务/业务日志（INFO 及以上）
        logs\\script-server-error.log   仅 ERROR 及以上（真正需要盯的那份）
+        logs\\script-server-audit.log   业务审计（一次运行一行 JSON：谁/哪台/跑什么/结果）
      轮转文件名为 <文件名>.YYYY-MM-DD，超过 14 个自动删最旧；
   4) 在当前进程内启动 uvicorn（workers=1，不 fork）。
 
@@ -39,6 +40,7 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 ACCESS_LOG = "script-server-access.log"
 SERVICE_LOG = "script-server-out.log"
 ERROR_LOG = "script-server-error.log"
+AUDIT_LOG = "script-server-audit.log"      # 业务审计：一次运行一行 JSON
 
 
 def load_env(path: Path) -> None:
@@ -78,10 +80,11 @@ def setup_logging(
     when: str = "midnight",
     backup_count: int = LOG_BACKUP_DAYS,
 ) -> bool:
-    """配置访问/业务/错误三份日志。
+    """配置访问/业务/错误/审计四份日志。
 
     访问日志单独挂到 uvicorn.access 并关闭向 root 传播（否则每条请求会在 out.log 里重复一份）；
-    业务与错误两份都挂 root：ERROR 会同时出现在 out.log（完整时间线）和 error.log（只读错误）。
+    业务与错误两份都挂 root：ERROR 会同时出现在 out.log（完整时间线）和 error.log（只读错误）；
+    审计日志挂在 "audit" logger 且不向 root 传播：一次运行一行 JSON，与运行日志分开检索。
     日志目录不可写时降级为 stderr，函数返回 False，**不阻止服务启动**。
     """
     root = logging.getLogger()
@@ -94,6 +97,7 @@ def setup_logging(
         access = _rotating_handler(log_dir / ACCESS_LOG, logging.INFO, when, backup_count)
         service = _rotating_handler(log_dir / SERVICE_LOG, logging.INFO, when, backup_count)
         error = _rotating_handler(log_dir / ERROR_LOG, logging.ERROR, when, backup_count)
+        audit = _rotating_handler(log_dir / AUDIT_LOG, logging.INFO, when, backup_count)
     except OSError as exc:
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
         logging.getLogger("serve").warning(
@@ -111,6 +115,14 @@ def setup_logging(
         old.close()
     access_logger.addHandler(access)
     access_logger.propagate = False
+
+    audit_logger = logging.getLogger("audit")
+    for old in list(audit_logger.handlers):
+        audit_logger.removeHandler(old)
+        old.close()
+    audit_logger.addHandler(audit)
+    audit_logger.setLevel(logging.INFO)
+    audit_logger.propagate = False
     return True
 
 

@@ -34,6 +34,7 @@ $CutoverLog = Join-Path (Split-Path -Parent $Root) 'logs\cutover.log'
 $OutLog   = Join-Path $Root 'logs\script-server-out.log'      # service/business log, INFO+
 $ErrLog   = Join-Path $Root 'logs\script-server-error.log'    # ERROR+ only
 $AccessLog = Join-Path $Root 'logs\script-server-access.log'  # access log, one line per request
+$AuditLog  = Join-Path $Root 'logs\script-server-audit.log'   # audit log, one JSON line per run
 
 function Get-Token {
     $t = $null
@@ -89,8 +90,8 @@ switch ($Action) {
     }
 
     'logs' {
-        # 3 files, rotated daily and kept for 14 days; archived names look like <name>.YYYY-MM-DD
-        foreach ($f in @($OutLog, $ErrLog, $AccessLog)) {
+        # 4 files, rotated daily and kept for 14 days; archived names look like <name>.YYYY-MM-DD
+        foreach ($f in @($OutLog, $ErrLog, $AccessLog, $AuditLog)) {
             Write-Host ("===== " + $f + " =====")
             if (Test-Path -LiteralPath $f) {
                 Get-Content -LiteralPath $f -Encoding UTF8 -Tail $Lines
