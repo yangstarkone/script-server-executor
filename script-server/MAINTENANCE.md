@@ -127,7 +127,7 @@ ERROR 在 out 与 error 里各有一份（out 保留完整时间线，error 只�
 python C:\ScriptServer\script-server\deploy\verify-logging.py
 # 在线验收（幂等/脚本内容指纹/三态码/并发策略/审计；共 11 项，需要服务在跑）
 python C:\ScriptServer\script-server\deploy\verify-hardening.py
-# 看审计（最近一次运行一行 JSON）
+# 看审计（最近一次运行，每行纯 JSON）
 Get-Content C:\ScriptServer\script-server\logs\script-server-audit.log -Tail 5
 # 看当前和历史
 Get-ChildItem C:\ScriptServer\script-server\logs\script-server-*.log* | Sort-Object LastWriteTime -Descending | Select-Object Name,Length,LastWriteTime

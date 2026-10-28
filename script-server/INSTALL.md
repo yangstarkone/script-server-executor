@@ -162,7 +162,7 @@ C:\ScriptServer\                        ← 建议根目录（不要放 C:\Progr
 │     ├─ script-server-out.log          ← 业务 INFO+
 │     ├─ script-server-error.log        ← 仅 ERROR+
 │     ├─ script-server-access.log       ← 每请求一行
-│     ├─ script-server-audit.log        ← 业务审计（一次运行一行 JSON）
+│     ├─ script-server-audit.log        ← 业务审计（每行纯 JSON）
 │     └─ watchdog.log
 ├─ scripts\                             ← 业务脚本目录（WF_SCRIPTS_DIR 指这里）
 │  ├─ hello.py

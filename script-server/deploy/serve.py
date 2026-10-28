@@ -11,7 +11,7 @@
        logs\\script-server-access.log  访问日志（一次 HTTP 请求一行）
        logs\\script-server-out.log     服务/业务日志（INFO 及以上）
        logs\\script-server-error.log   仅 ERROR 及以上（真正需要盯的那份）
-        logs\\script-server-audit.log   业务审计（一次运行一行 JSON：谁/哪台/跑什么/结果）
+        logs\\script-server-audit.log   业务审计（每行纯 JSON：谁/哪台/跑什么/结果）
      轮转文件名为 <文件名>.YYYY-MM-DD，超过 14 个自动删最旧；
   4) 在当前进程内启动 uvicorn（workers=1，不 fork）。
 
@@ -40,7 +40,7 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 ACCESS_LOG = "script-server-access.log"
 SERVICE_LOG = "script-server-out.log"
 ERROR_LOG = "script-server-error.log"
-AUDIT_LOG = "script-server-audit.log"      # 业务审计：一次运行一行 JSON
+AUDIT_LOG = "script-server-audit.log"      # 业务审计：每行纯 JSON
 
 
 def load_env(path: Path) -> None:
@@ -89,7 +89,7 @@ def setup_logging(
 
     访问日志单独挂到 uvicorn.access 并关闭向 root 传播（否则每条请求会在 out.log 里重复一份）；
     业务与错误两份都挂 root：ERROR 会同时出现在 out.log（完整时间线）和 error.log（只读错误）；
-    审计日志挂在 "audit" logger 且不向 root 传播：一次运行一行 JSON，与运行日志分开检索。
+    审计日志挂在 "audit" logger 且不向 root 传播：每行纯 JSON，与运行日志分开检索。
     日志目录不可写时降级为 stderr，函数返回 False，**不阻止服务启动**。
     """
     root = logging.getLogger()
