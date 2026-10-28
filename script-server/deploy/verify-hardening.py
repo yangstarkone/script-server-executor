@@ -28,7 +28,7 @@ PROBE = SCRIPTS_DIR / "_hardening_probe.py"
 FAIL_SCRIPT = SCRIPTS_DIR / "_hardening_fail.py"
 AUDIT_LOG = ROOT / "logs" / "script-server-audit.log"
 STAMP = time.strftime("%H%M%S")
-SECRET = "SECRET-ARG-" + uuid.uuid4().hex[:8]
+ARG_MARKER = "ARG-MARKER-" + uuid.uuid4().hex[:8]   # 用来验证「参数不落明文日志」的标记串
 
 FAILED: list[str] = []
 TOKEN = ""
@@ -82,7 +82,7 @@ def test_version() -> None:
 def test_code_and_dedupe() -> tuple[bool, float]:
     body = {
         "file_path": "hello.py",
-        "args": f"--name {SECRET}",
+        "args": f"--name {ARG_MARKER}",
         "timeout_seconds": 30,
         "task_run_id": f"hard-ok-{STAMP}",
     }
@@ -185,8 +185,8 @@ def test_audit_log() -> None:
     check("audit.log 有 run.start / run.dedup / run.finish",
           has_start and has_dedup and has_finish,
           f"start={has_start} dedup={has_dedup} finish={has_finish}")
-    check("audit.log 不落明文参数", SECRET not in text,
-          f"secret_found={SECRET in text}")
+    check("audit.log 不落明文参数", ARG_MARKER not in text,
+          f"marker_found={ARG_MARKER in text}")
 
 
 def main() -> int:
