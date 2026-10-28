@@ -1,6 +1,6 @@
 # script-server 执行器 · 运维手册
 
-> 适用版本：`script_server.py` **3.2.0**；托管方式：**Windows 计划任务直接运行 `deploy\serve.py` + 1 分钟 watchdog**。
+> 适用版本：`script_server.py` **3.3.0**；托管方式：**Windows 计划任务直接运行 `deploy\serve.py` + 1 分钟 watchdog**。
 > 安装/首次验收见 [`INSTALL.md`](INSTALL.md)。
 > 本文“实测”均指 2026-10-27 在 192.168.1.210（SERVICE）上的实际结果。
 
@@ -30,7 +30,7 @@ Windows Task Scheduler
 | 配置 | `.env`（token / 脚本目录 / 状态目录 / 并发） |
 | 业务脚本 | `C:\ScriptServer\scripts`，额外允许根 `E:\workflow-scripts-center` |
 | 状态目录 | `C:\ScriptServer\.script_server_state`（缓存 + running.json） |
-| 服务日志 | `logs\script-server-out.log`（业务 INFO+）、`logs\script-server-error.log`（仅 ERROR+）、`logs\script-server-access.log`（每请求一行）；均在本地按天轮转，保留 14 天 |
+| 服务日志 | `logs\script-server-out.log`（业务 INFO+）、`logs\script-server-error.log`（仅 ERROR+）、`logs\script-server-access.log`（每请求一行）、`logs\script-server-audit.log`（审计，一次运行一行 JSON）；均在本地按天轮转，保留 14 天 |
 | 看护日志 | `logs\watchdog.log` |
 | 切换日志 | `C:\ScriptServer\logs\cutover.log` |
 | 运维入口 | `deploy\ops-http.ps1`、`start-script-server.bat`、`env-change-restart.bat` |
@@ -107,22 +107,28 @@ Get-Content C:\ScriptServer\script-server\logs\watchdog.log -Tail 10 -Encoding U
 | 服务输出 | `logs\script-server-out.log` | 业务/服务 INFO+：`[serve] start`、任务启动/完成/超时/取消、WARNING，以及 ERROR 的副本（完整时间线） |
 | 服务错误 | `logs\script-server-error.log` | **仅 ERROR+**：异常栈、`kill_failed`、状态目录不可写等；平时应为空 |
 | 访问日志 | `logs\script-server-access.log` | 一次 HTTP 请求一行（客户端、方法、路径、状态码）；每请求都写，量最大 |
+| 审计日志 | `logs\script-server-audit.log` | 一次运行一行 JSON：`run.start` / `run.dedup` / `run.finish` / `run.reject` / `run.cancel`；含 run_id、客户端 IP、脚本名、脚本 sha、参数 sha（**不含明文参数**）、超时、耗时、`code`/`exit_code` |
 | 看护 | `logs\watchdog.log` | 仅在“掉了→拉起”时写 |
 | 切换 | `C:\ScriptServer\logs\cutover.log` | 安装/切换过程 |
 | 验收结果 | `C:\ScriptServer\logs\verify-result.json` | `verify-10.ps1` 的 JSON |
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File $ops logs   # 三份服务日志 + 归档列表 + 切换日志（UTF-8）
+powershell -NoProfile -ExecutionPolicy Bypass -File $ops logs   # 四份服务日志 + 归档列表 + 切换日志（UTF-8）
 ```
 
-**已内置轮转**（`serve.py` 的 `setup_logging()`，2026-10-28 起）：三份日志都按天切分，
+**已内置轮转**（`serve.py` 的 `setup_logging()`，2026-10-28 起）：四份日志都按天切分，
 历史文件名为 `<文件名>.YYYY-MM-DD`，每份保留 **14 份**（更旧的自动删除），不需要任何外部轮转工具或额外计划任务。
-分配规则：`uvicorn.access` → access；root（业务 + `uvicorn.error`）→ out（INFO+）与 error（ERROR+），
-所以 ERROR 在 out 与 error 里各有一份（out 保留完整时间线，error 只用来盯错误）。
+分配规则：`uvicorn.access` → access；root（业务 + `uvicorn.error`）→ out（INFO+）与 error（ERROR+）；
+`audit` → audit（不向 root 传播），所以审计行不会在 out 里重复。
+ERROR 在 out 与 error 里各有一份（out 保留完整时间线，error 只用来盯错误）。
 
 ```powershell
-# 自查（离线验收：分级/中文/14 份默认/轮转与保留是否真的生效）
+# 自查（离线验收：分级/中文/14 份默认/轮转与保留是否真的生效；共 17 项）
 python C:\ScriptServer\script-server\deploy\verify-logging.py
+# 在线验收（幂等/脚本内容指纹/三态码/并发策略/审计；共 11 项，需要服务在跑）
+python C:\ScriptServer\script-server\deploy\verify-hardening.py
+# 看审计（最近一次运行一行 JSON）
+Get-Content C:\ScriptServer\script-server\logs\script-server-audit.log -Tail 5
 # 看当前和历史
 Get-ChildItem C:\ScriptServer\script-server\logs\script-server-*.log* | Sort-Object LastWriteTime -Descending | Select-Object Name,Length,LastWriteTime
 ```
@@ -140,7 +146,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ops tasks    # 运行中任
 
 判据：
 
-- `/health` 200：进程活着；`version=3.2.0`、`auth_required=true`、`draining=false`。
+- `/health` 200：进程活着；`version=3.3.0`、`auth_required=true`、`draining=false`。
 - `/health/ready` 200 且 `status=ok`：脚本目录可写、状态目录可用、解释器存在、并发未满。
 - `status=degraded`：活着但不能执行（看 `checks` 哪项 false）。
 - 401：调用方 token ≠ `.env`。
@@ -228,6 +234,7 @@ curl.exe -s -o NUL -w "%{http_code}" -H "X-Script-Token: <新>" http://127.0.0.1
 
 | 日期 | 变更 |
 |---|---|
+| 2026-10-28 | **3.3.0**：幂等指纹加入脚本内容 sha256（脚本改了会重跑）；响应新增 `code`（200/500/502）与 `timed_out`；新增 `block_strategy`（reject 默认 / queue 排队）、429/409 带 `Retry-After`；新增审计日志 `script-server-audit.log`（服务日志共 4 份）且运行日志不再落明文 argv；未知字段打 WARNING；新增在线验收 `deploy\verify-hardening.py`（11 项） |
 | 2026-10-28 | 日志拆成 access / out / error 三份，内置按天轮转、保留 14 天（`serve.py:setup_logging()`）；新增离线验收 `deploy\verify-logging.py`；`ops-http.ps1 logs` 显示三份 + 归档 |
 | 2026-10-27 | 执行器改为计划任务托管 `serve.py`；新增 watchdog（实测 `RestartOnFailure` 无效）；清理旧守护进程相关文件；本文合并原运维 runbook 与原说明书第 5 章 |
 | 2026-10-28 | 文档与现架构对齐：删除旧架构安装/运维文档与配置备份，统一到 `INSTALL.md` / `MAINTENANCE.md` / `deploy\INSTALL-EXECUTOR.md` / `INSTALL-RECORD.md` |

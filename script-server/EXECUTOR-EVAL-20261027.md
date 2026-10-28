@@ -6,6 +6,7 @@
 > 探针脚本与原始结果：`C:\ScriptServer\logs\eval-probe{,2,3}.py`、`eval-extra{,3}.json`（`logs/` 已 gitignore）
 > 说明：本文所有“实测”均为本轮真实执行的结果；“代码事实”为读源码得出、未构造场景实测的结论。
 > **2026-10-28 修订**：P1-3（日志分级 + 每日轮转）已修复并上线，见 `INSTALL-RECORD.md` §10.11、`MAINTENANCE.md` §5。
+> **2026-10-28 10:32 再修订（3.3.0）**：本报告中的 3 项 FAIL 与 2 项 P1 已修复，见文末「9. 修复状态」。报告其余内容保持测评当时原貌（3.2.0），便于对照。
 
 ## 0. 结论
 
@@ -177,7 +178,7 @@
 
 **P0（1~2 天）**
 1. 执行器降权：专用低权限账户 + 脚本目录 ACL + 内网可达性收敛（半天）。
-2. 幂等指纹加脚本 `mtime+size` 或文档强制“run_id 每次新生成”（2h）。
+2. 幂等指纹加脚本 `mtime+size` 或文档强制“run_id 每次新生成”（2h）。 ✅ **已完成 2026-10-28（改为含脚本内容 sha256）**
 3. 日志分级 + 轮转（半天）。 ✅ **已完成 2026-10-28**
 
 **P1（1 周）**
@@ -188,7 +189,7 @@
 **P2（有空）**
 7. 压测后把并发从 4 调到 8~12（IO 型脚本）（2h）。
 8. 截断保留头尾、stdout/stderr 带标记合并、`/tasks/{id}/log` 流式（半天）。
-9. args 空引号、`/scan` 返回相对路径、日志不落完整 argv（2h）。
+9. args 空引号、`/scan` 返回相对路径、日志不落完整 argv（2h）。 → 日志不落明文 argv **✅ 已完成 2026-10-28**；args 空引号/scan 相对路径未做
 10. 依赖锁定 + 升级检查单（2h）。
 11. 需要跨网段时加 TLS/反代（半天）。
 
@@ -208,4 +209,22 @@
 & "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" C:\ScriptServer\logs\eval-probe3.py
 # 2) 验收冒烟
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\ScriptServer\script-server\deploy\verify-10.ps1
+# 3) 3.3.0 加固项在线验收（幂等/内容指纹/三态码/并发策略/审计）
+& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" C:\ScriptServer\script-server\deploy\verify-hardening.py
 ```
+
+## 9. 修复状态（3.3.0，2026-10-28 10:32 上线并验收）
+
+| 测评发现 | 3.3.0 处理 | 验收证据 |
+|---|---|---|
+| FAIL：脚本改了、同 `task_run_id` 仍返回旧结果 | 幂等指纹加入**脚本内容 sha256**（+ size/mtime_ns） | `verify-hardening.py`「内容指纹生效」：改脚本后同 ID 返回 `PROBE-B`，未命中缓存 |
+| FAIL：未知字段静默忽略 | **仍接受但打 WARNING** 列出字段名（不用 `extra=forbid`：避免平台多传字段被 422 打断） | 代码 `logger.warning("POST /run 收到未识别字段")` |
+| FAIL：429 无 `Retry-After` | 429 带 `Retry-After: 5`；409 也带；新增 `block_strategy=queue` 排队 | `verify-hardening.py`：429 + `Retry-After='5'`；queue 等 4.9s 后成功 |
+| P0：无调用者审计 | 新增 `script-server-audit.log`（`run.start`/`run.dedup`/`run.finish`/`run.reject`/`run.cancel`） | `verify-hardening.py`：三类事件齐全、明文参数不落盘 |
+| P2：日志落完整 argv | 运行日志改为脚本名 + `args_len` + `args_sha` | 同上 |
+| P2：超时与失败难区分 | 响应新增 `code`（200/500/502）与 `timed_out` | `verify-hardening.py`：失败 `code=500`、超时 `code=502`+`timed_out=true` |
+
+**仍未做**（按用户「只用 Python、别把系统搞复杂」的约束，保持现状）：
+P0-1 执行器降权/ACL（系统级改动，需单独确认）、P1-4 pytest+CI、TLS/反代、`args` 空引号、
+`/scan` 相对路径、`/tasks/{id}/log` 流式、并发从 4 调大（需压测）。
+**评分不变**：7.0/10 —— 功能与可观测提高，但安全模型（token=管理员级 RCE、明文 HTTP、无 TLS）没变。

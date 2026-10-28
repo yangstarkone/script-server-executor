@@ -1,6 +1,6 @@
 # script-server（脚本执行器）新设备安装与使用说明
 
-> **适用版本**：`script_server.py` VERSION = **3.2.0**（单文件 FastAPI）
+> **适用版本**：`script_server.py` VERSION = **3.3.0**（单文件 FastAPI）
 > **适用对象**：在一台全新 Windows 机器上安装、启动、接入平台的运维/实施工程师
 > **托管方式**：Windows 计划任务直接运行 `deploy\serve.py`，另有 1 分钟 watchdog 兜底（只依赖 Python）
 > **文档日期**：2026-10-27（按新托管方式重写）
@@ -155,12 +155,14 @@ C:\ScriptServer\                        ← 建议根目录（不要放 C:\Progr
 │  │  ├─ ops-http.ps1                   ← 日常运维（health/ready/tasks/logs/status/restart/drain）
 │  │  ├─ verify-10.ps1                  ← 10 项验收
 │  │  ├─ verify-logging.py              ← 日志分级/轮转离线验收
+│  │  ├─ verify-hardening.py            ← 幂等/三态码/并发策略/审计 在线验收
 │  │  ├─ INSTALL-EXECUTOR.md             ← 新设备部署步骤（简版）
 │  │  └─ register-autostart-task.ps1     ← 备用：单独注册自启任务（install.bat 之外）
 │  └─ logs\                             ← 服务日志（serve.py 自动建，按天轮转保留 14 天）
 │     ├─ script-server-out.log          ← 业务 INFO+
 │     ├─ script-server-error.log        ← 仅 ERROR+
 │     ├─ script-server-access.log       ← 每请求一行
+│     ├─ script-server-audit.log        ← 业务审计（一次运行一行 JSON）
 │     └─ watchdog.log
 ├─ scripts\                             ← 业务脚本目录（WF_SCRIPTS_DIR 指这里）
 │  ├─ hello.py
@@ -345,7 +347,7 @@ cd C:\ScriptServer\script-server
 python .\deploy\serve.py --host 127.0.0.1 --port 9000
 ```
 
-看到 `[serve] start pid=... version=3.2.0 ...` 与 `Uvicorn running on http://127.0.0.1:9000` 即成功；
+看到 `[serve] start pid=... version=3.3.0 ...` 与 `Uvicorn running on http://127.0.0.1:9000` 即成功；
 另开窗口验证后 `Ctrl+C` 停止。前台方式日志只在控制台，生产不要这么跑。
 
 **方式 B：计划任务（生产标准做法）**
@@ -495,7 +497,7 @@ Start-Process powershell.exe -Verb RunAs -ArgumentList @(
 | # | 检查 | 命令 | 通过判据 | 失败先查 |
 |---|---|---|---|---|
 | 1 | 端口监听 | `netstat -ano \| findstr :9000` | 有 `LISTENING` | 进程没起 / 端口被占（`WinError 10048`）→ `ops-http.ps1 logs` |
-| 2 | 公开探活 | `curl.exe -s http://127.0.0.1:9000/health` | 200，`version=3.2.0`，`auth_required=true`，`draining=false` | 仍是 `auth_required=false` → `.env` 未生效；版本不是 3.2.0 → 跑了旧代码 |
+| 2 | 公开探活 | `curl.exe -s http://127.0.0.1:9000/health` | 200，`version=3.3.0`，`auth_required=true`，`draining=false` | 仍是 `auth_required=false` → `.env` 未生效；版本不是 3.3.0 → 跑了旧代码 |
 | 3 | 无 token 拒绝 | `curl.exe -s -o NUL -w "%{http_code}" http://127.0.0.1:9000/health/ready` | `401` | 返回 200 → token 没配（危险） |
 | 4 | 带 token 就绪 | `curl.exe -s -H "X-Script-Token: $t" http://127.0.0.1:9000/health/ready` | `status=ok`，`checks.state_dir.enabled=true`，`checks.python.exists=true` | `degraded` → 看 `checks` 哪个 `false` |
 | 5 | Bearer 兼容 | `-H "Authorization: Bearer $t"` 调 `/health/ready` | 200 | — |
@@ -613,6 +615,7 @@ HTTP 401                                          → token 不一致（最常�
 | `env` | object | 否 | `{}` | 追加/覆盖环境变量（值必须字符串）；危险键（`PYTHONPATH`/`PATH`/`WF_SCRIPT_*` 等）→ 400；超过 65536 个字符 → 413 |
 | `timeout_seconds` | int | 否 | 300 | 1–7200；越界 → 422 |
 | `task_run_id` | string | 否 | 自动生成 | 幂等键 + 取消键；建议直接用平台 TaskRun id |
+| `block_strategy` | string | 否 | `reject` | 并发满时的策略：`reject` = 立即 429（带 `Retry-After`）；`queue` = 排队等空槽（最多 `WF_QUEUE_MAX_WAIT_SECONDS`=30s 或本次 `timeout_seconds`，取小） |
 
 #### 调用示例
 
@@ -667,12 +670,14 @@ print(data["stdout"])
 | 字段 | 说明 |
 |---|---|
 | `task_id` | 本次任务 ID（= 传入的 `task_run_id`，否则自动生成） |
+| `code` | **三态判定码**：`200` 成功 / `500` 失败或取消 / `502` 超时（与 `exit_code` 互补，平台建议优先看它） |
 | `exit_code` | 退出码；**超时/取消为 -1**；服务端内部异常为 3 |
 | `stdout` / `stderr` | 标准输出/错误（UTF-8/GBK 智能解码；超上限截断） |
 | `success` | 仅 `exit_code==0` 为 true |
 | `partial` | `exit_code==1` 且不是崩溃时为 true（"部分成功"） |
 | `status_label` | 成功 / 部分成功 / 网络错误 / 脚本错误 / 脚本超时 / 任务取消 / 终止失败 |
 | `cancelled` | 是否因取消（/cancel、断连、关停）结束 |
+| `timed_out` | 是否因超时结束（此时 `code=502`） |
 | `deduplicated` | 是否命中幂等缓存（本次未真正执行） |
 | `truncated` | 输出是否被截断 |
 | `duration_seconds` | 执行耗时 |
@@ -680,10 +685,24 @@ print(data["stdout"])
 示例：
 
 ```json
-{"task_id":"manual-001","exit_code":0,"stdout":"hello from script-server\n","stderr":"",
- "success":true,"partial":false,"status_label":"成功","cancelled":false,
+{"task_id":"manual-001","code":200,"exit_code":0,"stdout":"hello from script-server\n","stderr":"",
+ "success":true,"partial":false,"status_label":"成功","cancelled":false,"timed_out":false,
  "deduplicated":false,"truncated":false,"duration_seconds":0.42}
 ```
+
+#### 幂等与"平台重试"的关系（3.3.0，务必读懂）
+
+| 情况（同一个 `task_run_id`） | 执行器行为 | 平台该怎么做 |
+|---|---|---|
+| 上次**成功**，响应丢了又重投 | 返回历史结果（`deduplicated=true`，`code=200`），**不会二次执行** | 当成成功继续；不要再换 ID 重跑（会产生重复副作用） |
+| 上次**失败/超时/取消**（exit≠0、`code=500/502`） | **不缓存**，重投会真正重跑 | 正常重试即可，幂等不会挡 |
+| 上次**还在运行** | `409` + `Retry-After` | 等几秒再查 `/tasks`，不要当成执行失败 |
+| 从未见过这个 ID | 正常执行 | — |
+| 脚本**内容改过**了，仍用旧 ID | 指纹含脚本 sha256 → 判定为新请求，**重跑**（不会返回旧结果） | 无需处理 |
+| 平台每次重试都**换新** `task_run_id` | 每次都执行（幂等不介入） | 需要"同一次执行只跑一次"就固定 ID |
+
+> 结论：**失败重试不受幂等影响**（失败不缓存）；幂等只防"其实已成功但响应丢了"的重复执行。
+> 只有 exit 0 才写缓存（`results/<sha1(task_run_id)>.json`，TTL 24h）。
 
 #### HTTP 状态码
 
@@ -693,10 +712,10 @@ print(data["stdout"])
 | 400 | 路径无效/不存在/不是文件、args 引号未闭合、env 键非法 | 修正参数，不要重试 |
 | 401 | token 缺失/错误 | 检查 token，不要重试 |
 | 403 | 路径在允许目录外、扩展名不允许 | 修正路径/配置，不要重试 |
-| 409 | 同 `task_run_id` 仍在运行（含"刚退出还没收尾"的窗口） | **不要自动重试**，查 `/tasks` 人工核对 |
+| 409 | 同 `task_run_id` 仍在运行（含"刚退出还没收尾"的窗口） | 响应带 `Retry-After: 5`；等几秒后查 `/tasks`，确认是"上次响应丢了"还是平台超时判失败 |
 | 413 | `args` 或 `env` 超过 65536 个字符 | 减少参数 |
 | 422 | 请求体不合法（timeout 越界、类型错、JSON 错） | 修正请求 |
-| 429 | 并发已满（默认 4） | 退避重试（平台自动 2/4/6s 共 3 次） |
+| 429 | 并发已满（默认 4），响应带 `Retry-After: 5` | 退避重试，或改传 `"block_strategy":"queue"` 让执行器排队 |
 | 500 | 服务端自身异常（典型：`/cancel` 杀进程树失败，可重试）；注意 `/run` 的**服务端内部异常仍返回 200 + `exit_code=3`**，不要只看 HTTP 码 | 看日志与 `counters.kill_failed` |
 | 503 | 排空模式（调过 `/drain`） | 等待重启恢复；响应带 `Retry-After: 10` |
 
@@ -891,7 +910,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ops logs      # 服务日�
 | 超时后拿不到 `exit_code=4` | 超时/取消实际返回 `-1` | 用 `status_label`/`cancelled` 判定 |
 | 脚本异常被平台当"部分成功"继续跑 | Python 默认退出码 1 = 部分成功 | 脚本内显式 `sys.exit(2)` 以上 |
 | 同 ID 重投又执行了一次 | 没传 `task_run_id`，或参数变了导致指纹不符 | 固定 `task_run_id` 且参数不变 |
-| 改了脚本但同 ID 仍返回旧结果 | 缓存指纹不含脚本内容（TTL 24h） | 删 `results\<sha1(task_id)>.json`、换 `task_run_id` 或等 TTL |
+| 改了脚本但同 ID 仍返回旧结果 | 3.2.0 的缓存指纹不含脚本内容（3.3.0 已改为含脚本 sha256，正常情况下不会再出现） | 3.3.0 起无需处理；若仍复现，确认跑的是 3.3.0（`/health` 的 version），再删 `results\<sha1(task_id)>.json` |
 | 429 频繁 | 并发打满（默认 4） | 降调用并发或调大 `WF_MAX_CONCURRENCY`（按 CPU/内存） |
 | 409 后任务"卡住" | 设计如此（防二次执行） | 查 `/tasks` 人工核对，必要时 `/cancel` |
 | 长脚本跑到一半被取消 | 客户端断开即取消（`WF_CANCEL_ON_DISCONNECT=1`） | 反向代理/负载均衡超时 > 脚本超时；或设为 0（不建议） |
@@ -1052,5 +1071,25 @@ Get-ScheduledTask -TaskName 'WorkflowPlatform-ScriptServer-Watchdog' | Format-Li
 
 ---
 
-本文依据 `script_server.py` 3.2.0、`deploy\serve.py`、`.env.example`、`deploy\*` 脚本与 192.168.1.210 的实测记录编写。
+## 附录 E：3.3.0（2026-10-28）变更——幂等/重试/并发/审计
+
+升级方式：替换 `script_server.py` + `deploy\serve.py`，然后重启主任务（`ops-http.ps1 restart`，或提权跑 `logs\apply-hardening.ps1` 那种脚本）。**平台侧无需改动即可兼容**（只新增字段/头，不改既有语义）。
+
+| # | 变更 | 影响 |
+|---|---|---|
+| 1 | 幂等指纹加入**脚本内容 sha256** | 脚本改了以后同一 `task_run_id` 会重跑，不再返回旧结果；只有 exit 0 才缓存（不变） |
+| 2 | 响应新增 `code`（200/500/502）与 `timed_out` | 平台可不再靠 `status_label` 文案判断超时；老字段全部保留 |
+| 3 | 新增请求参数 `block_strategy`（`reject` 默认 / `queue`） | `reject` 行为与 3.2.0 一致，只是 429 现在**带 `Retry-After: 5`**；`queue` 让执行器排队等空槽（上限 `WF_QUEUE_MAX_WAIT_SECONDS`，默认 30s） |
+| 4 | 409 也带 `Retry-After: 5` | "上次响应丢了"的场景，平台等一会儿再查，而不是判失败 |
+| 5 | 新增 `logs\script-server-audit.log`（按天轮转、保留 14 天） | 一次运行一行 JSON：`run.start` / `run.dedup` / `run.finish` / `run.reject` / `run.cancel`，含 run_id、客户端 IP、脚本名、脚本与参数摘要、超时、耗时、code/exit_code |
+| 6 | 运行日志不再落**明文 argv** | `out.log` 只记脚本名 + `args_len` + `args_sha`（参数内容从旧记录里查；敏感参数不再泄漏） |
+| 7 | 未知请求字段不再静默忽略 | 仍接受（向前兼容），但会打 WARNING 列出字段名，便于发现平台字段名写错 |
+| 8 | 新增在线验收 `deploy\verify-hardening.py` | 11 项：版本/首跑/幂等/内容指纹/失败码/超时码/并发 reject/并发 queue/审计内容/不透明文 |
+| 9 | `/health` 计数器新增 `queued` | 能看到排队次数 |
+
+验收（本机 2026-10-28 实测）：`verify-10.ps1` **10/10 PASS**、`verify-hardening.py` **11/11 PASS**、`verify-logging.py` **17/17 PASS**。
+
+---
+
+本文依据 `script_server.py` 3.3.0、`deploy\serve.py`、`.env.example`、`deploy\*` 脚本与 192.168.1.210 的实测记录编写。
 托管方式、开机自启、watchdog 恢复与平台端到端链路在该机已实测；新设备仍请按第 3 章验收。

@@ -23,7 +23,7 @@
 | OS | Windows 10.0.26100（16 逻辑核） |
 | Python | 3.12.10 · `C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe` |
 | 依赖 | fastapi 0.119.1 / uvicorn 0.49.0 / pydantic 2.13.4（满足 `requirements.txt`） |
-| 执行器 | `script_server.py` 3.2.0 |
+| 执行器 | `script_server.py` 3.3.0（2026-10-28 由 3.2.0 加固升级） |
 
 > 注意：普通 PATH 里 `python` 会先命 `WindowsApps\python.exe`（0 字节 Store 存根），
 > 注册任务必须用真实解释器路径。`cutover-to-uvicorn-task.ps1` 的 `Find-Python` 已按候选路径规避。
@@ -60,7 +60,9 @@
 | 2026-10-26 | Stop/Start 冷启动等价测试 | ✅ `/health` 立即 200 |
 | 2026-10-27 | `verify-10.ps1`（`install.bat` 重装后） | ✅ 10/10 PASS |
 | 2026-10-28 09:37 | `verify-10.ps1`（日志改造重启后） | ✅ 10/10 PASS（提权下端口检查正常） |
-| 2026-10-28 | `verify-logging.py` | ✅ 14/14 PASS |
+| 2026-10-28 10:32 | `verify-10.ps1`（3.3.0 加固重启后） | ✅ 10/10 PASS（version=3.3.0） |
+| 2026-10-28 10:32 | `verify-hardening.py`（在线，11 项） | ✅ 11/11 PASS |
+| 2026-10-28 | `verify-logging.py` | ✅ 17/17 PASS（含 audit 日志） |
 | 2026-10-28 09:01:55 | **真实重启开机自启** | ✅ 09:02:12 自动起来（`[serve] start pid=5100`），无人登录 |
 
 **开机自启验证依据**：系统事件日志 `System/6005` 显示 2026-10-28 09:01:55 启动；
@@ -105,13 +107,29 @@ New-NetFirewallRule -DisplayName "script-server 9000" -Direction Inbound -Protoc
 - 线上验证：access.log 只含访问行；out.log 有业务 INFO/WARNING；error.log 自重启起 0 行新增。
 - 未验证：跨午夜真实轮转（等 2026-10-29 00:00 后确认 `script-server-*.log.2026-10-28` 出现）；14 份淘汰需 15 天。
 
-### 2.9 证据文件
+### 2.9 加固升级 3.2.0 → 3.3.0（2026-10-28 10:32）
+
+- 背景：测评（`EXECUTOR-EVAL-20261027.md`）遗留项 + 用户确认「失败重试不能被幂等挡住」。
+- 改动（`script_server.py`）：① 幂等指纹加入**脚本内容 sha256**（脚本改了同 `task_run_id` 会重跑）；
+  ② 响应新增 `code`（200/500/502）与 `timed_out`；③ 新增 `block_strategy`（`reject` 默认 / `queue` 排队，
+  `WF_QUEUE_MAX_WAIT_SECONDS` 默认 30s）；429/409 都带 `Retry-After`；④ 审计日志 `script-server-audit.log`；
+  ⑤ 运行日志不再落明文 argv（只记脚本名 + `args_sha`）；⑥ 未知字段仍接受但打 WARNING。
+- 改动（`deploy\serve.py`）：`setup_logging()` 增加第 4 份日志 `script-server-audit.log`（同样按天轮转、保留 14 份）。
+- 应用：提权跑 `logs\apply-hardening.ps1`（暂停 watchdog → Stop/Start 任务 → 等 `/health` → 验收）。
+  结果：10:32:27 `/health` 200 `version=3.3.0`（pid 17652），主任务 `State=Running`。
+- 验收：`verify-10.ps1` **10/10 PASS**；`verify-hardening.py` **11/11 PASS**（首跑/幂等/内容指纹/失败 500/超时 502/
+  reject 429+Retry-After/queue 排队 4.9s/审计三类事件/不落明文参数）；`verify-logging.py` **17/17 PASS**。
+- 未验证：平台侧（192.168.1.210）尚未实测新的 `block_strategy=queue` 与 `code` 字段的消费逻辑（执行器侧已就绪）。
+- 说明：失败/超时/取消**不写缓存**，所以平台「失败工作流里的重试」会真正重跑；幂等只防“已成功但响应丢失”的重投。
+
+### 2.10 证据文件
 
 | 内容 | 路径 |
 |---|---|
 | 重装全过程 | `C:\ScriptServer\logs\reinstall-report.log` |
 | 任务注册/切换 | `C:\ScriptServer\logs\cutover.log`、`logs\register-task.log` |
 | 日志改造 | `C:\ScriptServer\logs\apply-logging-20261028.log` |
+| 加固升级 3.3.0 | `C:\ScriptServer\logs\apply-hardening-20261028.log` |
 | 10 项验收结果 | `C:\ScriptServer\script-server\logs\verify-result.json` |
 | 运维操作日志 | `C:\ScriptServer\script-server\logs\watchdog.log` |
 
@@ -123,4 +141,5 @@ New-NetFirewallRule -DisplayName "script-server 9000" -Direction Inbound -Protoc
 | 2026-10-27 17:41 | `install.bat` 一键重装：注册主任务 + watchdog；`Find-Python` 规避 Store 存根 |
 | 2026-10-27 17:46 | 移除旧进程守护组件（配置、数据目录、命令入口） |
 | 2026-10-28 09:37 | 日志拆成 access/out/error 三份 + 内置按天轮转保留 14 天 |
+| 2026-10-28 10:32 | **3.3.0 加固**：内容指纹 / 三态 code / block_strategy / 审计日志（4 份日志）；verify-10 10/10 + verify-hardening 11/11 |
 | 2026-10-28 | 文档清理：删除旧架构安装/运维文档与备份配置，统一到 INSTALL / MAINTENANCE / 本记录 |

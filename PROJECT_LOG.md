@@ -6,30 +6,60 @@
 
 ## 当前状态
 
-- 目标：在 `C:\ScriptServer` 运行 standalone script-server 执行器（FastAPI/uvicorn，VERSION 3.2.0），供平台「设备管理」派发脚本。
+- 目标：在 `C:\ScriptServer` 运行 standalone script-server 执行器（FastAPI/uvicorn，VERSION 3.3.0），供平台「设备管理」派发脚本。
 - 本机：`YANGSTARONE` / `192.168.1.220` / 账户 `Administrator`；包从旧机 `WUYUAN`（192.168.1.222）整体拷贝而来。
 - 运行方式：Windows 计划任务 `WorkflowPlatform-ScriptServer`（AtStartup / S4U / Highest）直接托管 `python deploy\serve.py`（uvicorn 单 worker，`0.0.0.0:9000`），另有 1 分钟看护任务 `WorkflowPlatform-ScriptServer-Watchdog`。
-- 现状（2026-10-28 09:37 为应用日志改造重启后，pid 25888）：主任务 Running，`/health` 200，`verify-10.ps1` **10/10 PASS**；动作指向真实解释器 `...\Python312\python.exe`；日志已拆成 access/out/error 三份并按天轮转、保留 14 天。
-- 能跑通：`deploy\verify-10.ps1` 10/10（2026-10-28 09:37、2026-10-27 重装后、2026-10-26 均通过）；`deploy\verify-logging.py` 14/14（日志分级/轮转离线验收）。
+- 现状（2026-10-28 10:32 为 3.3.0 加固重启后，pid 17652）：主任务 Running，`/health` 200 `version=3.3.0`；日志 4 份（access/out/error/**audit**）均按天轮转保留 14 天；响应新增 `code`/`timed_out`、请求新增 `block_strategy`、幂等指纹含脚本 sha256。
+- 能跑通：`deploy\verify-10.ps1` **10/10**（2026-10-28 10:32 / 09:37 / 10-27 / 10-26）；`deploy\verify-hardening.py` **11/11**（2026-10-28 10:32，在线）；`deploy\verify-logging.py` **17/17**（离线）。
 - 不能跑通：无。
 - 已验证：**真实重启开机自启 ✅**（系统 2026-10-28 09:01:55 启动，09:02:12 `serve.py` 自启，无人登录干预）；**平台设备登记 ✅**（192.168.1.210 每 60s 调 `/health/ready` 返回 200）。
-- 未验证：跨午夜的真实日志轮转（需等 2026-10-29 00:00 后看是否出现 `script-server-*.log.2026-10-28`）；14 份淘汰需 15 天观察。
+- 未验证：跨午夜的真实日志轮转（需等 2026-10-29 00:00 后看是否出现 `script-server-*.log.2026-10-28`）；14 份淘汰需 15 天观察；**平台侧尚未实测 `block_strategy=queue` 与 `code` 字段的消费**（执行器侧已就绪）。
 - 已知问题：当前网络位置=公用配置文件且**防火墙关闭**（域配置文件为开启），未加 9000 放行规则；DSH 沙箱里 `Get-NetTCPConnection`/`Get-ScheduledTask`/`Get-CimInstance`/`Get-Process` 均不可信（会隐藏进程或直接拒绝），端口/任务/进程状态必须用提权脚本或 `/health` 判断。
 - 环境事实：`E:\workflow-scripts-center` **存在**（约 1.7 万文件，2026-10-26 同步），`.env` 的 `WF_ALLOWED_SCRIPT_ROOTS` 白名单有效；本机 `node.exe` 进程属于 WorkBuddy、紫鸟等其它软件，不是执行器。
-- 下一步：① 2026-10-29 00:00 后确认首次跨天轮转产生归档；② 需要的话启用防火墙并只放行平台 IP/网段；③ 按测评 P0 项加固（降权 / 幂等指纹 / argv 脱敏，见待确认问题）。
-- 文档（2026-10-28 清理后）：`INSTALL.md`（安装+使用）、`MAINTENANCE.md`（运维）、`deploy\INSTALL-EXECUTOR.md`（新设备）、`INSTALL-RECORD.md`（本机安装记录）、`EXECUTOR-EVAL-20261027.md`（测评）；旧架构配置/文档已删除，仓库内已无相关引用。
+- 下一步：① 2026-10-29 00:00 后确认首次跨天轮转产生归档；② 需要的话启用防火墙并只放行平台 IP/网段；③ 测评剩余 P0-1（执行器降权 + 脚本目录 ACL，系统级，需确认）。
+- 文档（2026-10-28 清理后）：`INSTALL.md`（安装+使用，附录 E = 3.3.0 变更）、`MAINTENANCE.md`（运维）、`deploy\INSTALL-EXECUTOR.md`（新设备）、`INSTALL-RECORD.md`（本机安装记录 §2.9 = 3.3.0）、`EXECUTOR-EVAL-20261027.md`（测评 + §9 修复状态）；旧架构配置/文档已删除，仓库内已无相关引用。
 - 版本管理：GitHub 私有仓库 `script-server-executor`（main；`.env`、`logs/`、`.script_server_state/` 不入库）。
-- 测评（2026-10-27 18:40，详见 `script-server\EXECUTOR-EVAL-20261027.md`）：作为内网单机执行器 **7.0/10（合格）**；30 项黑盒探针实测 33/36 通过（3 项 FAIL：幂等缓存陈旧、args 空引号丢失、未知字段静默忽略）。主要风险：token=管理员级 RCE 且明文 HTTP 无审计；零自动化测试；文档曾与现架构漂移（2026-10-28 已清理）。日志 P1-3 已于 2026-10-28 修复。
+- 选型调研（2026-10-28）：GitHub 上无覆盖本场景（被中心平台调用/无头/token/幂等/并发上限/Windows 计划任务）的现成项目，结论**继续自研、只借鉴机制**（详见当日日志）。
+- 测评（2026-10-27 18:40，详见 `script-server\EXECUTOR-EVAL-20261027.md`）：作为内网单机执行器 **7.0/10（合格）**。2026-10-28 已修：幂等缓存陈旧、未知字段静默、429 无 Retry-After、无审计、argv 落盘、超时/失败不区分（3.3.0）。仍未修：token=管理员级 RCE + 明文 HTTP 无 TLS、零自动化测试（pytest/CI）、args 空引号、`/scan` 相对路径。
 - 最后更新：2026-10-28
 
 ## 待确认问题
 
 - 是否保留与旧机相同的 `WF_SCRIPT_TOKEN`？（沿用拷贝值即可让平台用同一 token 登记本机，若要求每台一 token 需同步改平台）
-- 是否继续做测评的其余 P0/P1 项：执行器降权到低权限账户 + 脚本目录 ACL、幂等指纹加脚本哈希、日志不落完整 argv、API 严格化（extra=forbid / 429 Retry-After）？降权要改计划任务账户与 ACL，属系统级改动，需确认后再动。
+- 是否继续做测评剩余 P0-1：执行器降权到低权限账户 + 脚本目录 ACL（要改计划任务账户与 ACL，属系统级改动，需确认后再动）。
+- 平台侧是否要改用新能力：`code` 判定（200/500/502）、`block_strategy=queue`（替代 429 退避）、409 的 `Retry-After` 等待逻辑？（执行器已就绪，需平台侧配合改）
 
 ---
 
 ## 日志（新→旧）
+
+### 2026-10-28 执行器 3.3.0 加固（脚本内容指纹 / 三态 code / 阻塞策略 / 审计日志）
+
+- 触发：用户问「平台的失败重试会不会被 run_id 幂等挡住」并批准其余加固项，约束「只用 Python、别把系统弄复杂」。
+- **结论（该问题）**：不影响。失败/超时/取消**从不写缓存**（3.2.0 起就只缓存 exit 0），同一 `task_run_id` 重投会真正重跑；幂等只防“已成功但响应丢失”的重复执行。会挡住重试的只有两种情况：① 同 ID 仍在跑 → 409（现带 `Retry-After: 5`）；② 脚本改过而指纹没变 → 旧 bug，3.3.0 把脚本 sha256 纳入指纹后消失。
+- 改 `script_server.py`（3.2.0 → 3.3.0）：① 幂等指纹加脚本内容 sha256；② `RunResponse` 增 `code`(200/500/502) 与 `timed_out`；③ `RunRequest` 增 `block_strategy`（`reject` 默认 / `queue`，`WF_QUEUE_MAX_WAIT_SECONDS`=30），429/409 带 `Retry-After: 5`；④ 审计 logger `audit`：`run.start`/`run.dedup`/`run.finish`/`run.reject`/`run.cancel` 一行 JSON（run_id、客户端 IP、脚本名+sha、args_sha、耗时、code/exit_code）；⑤ INFO 不再落明文 argv；⑥ 未知字段仍接受但打 WARNING；⑦ 计数器加 `queued`；⑧ 幂等查询移到路径校验之后（缓存不能绕过校验）。
+- 改 `deploy\serve.py`：第 4 份日志 `script-server-audit.log`（同样 `when=midnight`/`backupCount=14`，`audit` logger `propagate=False`）。
+- 新增 `deploy\verify-hardening.py`（11 项在线验收，纯 stdlib urllib，自动清理临时脚本）；`verify-logging.py` 扩到 17 项（含 audit）；`verify-10.ps1` 版本断言改 3.3.0；`ops-http.ps1 logs` 显示 audit。
+- 应用/验收：提权跑 `logs\apply-hardening.ps1` → 10:32:25 重启（pid 17652）、10:32:27 `/health` 200 `version=3.3.0`；`verify-10.ps1` **10/10**、`verify-hardening.py` **11/11**、`verify-logging.py` **17/17**（实测：queue 等 4.9s 后成功、429 `Retry-After='5'`、改脚本后同 ID 返回 PROBE-B、超时 `code=502`）。
+- 踩坑：① 本会话 shell 是 **Windows PowerShell 5.1**（不是 pwsh 7），`Get-Content -Raw` 默认按 ANSI 解码，用它改中文文件会把 UTF-8 写坏 → 已 `git checkout` 复原，改用编辑工具/Python 处理；② PATH 里 `python` 是 WindowsApps 0 字节存根，编译/运行必须用 `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`。
+- 未验证：平台侧（192.168.1.210）尚未消费新字段 `code`/`block_strategy`；跨午夜真实轮转仍待 2026-10-29 00:00。
+- 文档：`INSTALL.md` 附录 E、`MAINTENANCE.md` §5/§11、`deploy\INSTALL-EXECUTOR.md` §5/§8/§9、`INSTALL-RECORD.md` §2.9、`EXECUTOR-EVAL-20261027.md` §9、`.env.example`、`README.md`。
+
+### 2026-10-28 XXL-JOB 深入调研（哪些设计能借到本执行器上）
+
+- 版本/许可：最新 **3.5.0（2026-10-09）**，**GPL-3.0** → 只借鉴设计，不复制代码。
+- 已核对源码（master，未部署实测）：`Const.java`（`XXL-JOB-ACCESS-TOKEN` / `XXL-JOB-APPNAME` 请求头、`BEAT_TIMEOUT=30s`、`DEAD_TIMEOUT=90s`、优雅停机等待 5s）、`EmbedServer.java`（Netty 内嵌 HTTP Server，**仅 POST**，按 uri 分发 beat/idleBeat/trigger/kill/log，校验 accessToken+appname）、`JobThread.java`（`triggerLogIdSet` 按 logId 去重 → “repeat trigger job”；`FutureTask.get(executorTimeout)` 超时中断）、`ExecutorBlockStrategyEnum`（SERIAL_EXECUTION / DISCARD_LATER / COVER_EARLY）、`JobScheduleHelper`（`PRE_READ_MS=5000`、60 槽时间轮、`preReadCount=(fastMax+slowMax)*10`、scheduleThread+ringThread）、`JobTriggerPoolHelper`（快/慢双线程池隔离）、`JobRegistryHelper`（注册/剔除线程池 + monitor）、`TriggerCallbackThreadHelper`（回调 MessageQueue + 失败落文件重试线程）、`tables_xxl_job.sql`（`executor_timeout` 秒 / `executor_fail_retry_count` / `glue_source` / `trigger_next_time` / `misfire_strategy` / `executor_route_strategy`）。
+- 结论：**不引入 XXL-JOB**（GPL + Java/MySQL 重 + 本场景调度方已是平台），借鉴 5 项：① 按 `run_id` 去重（修幂等缓存陈旧）；② 三态返回码 200/500/502（超时单独区分）；③ 阻塞策略 serial/discard/cover（替代裸 429）；④ 执行器主动注册 + 30s 心跳 / 90s 剔除（替代平台轮询）；⑤ 按 run_id 查日志 + 审计字段。
+- 未验证：以上均来自源码/README 阅读，未部署 xxl-job 实测。
+
+### 2026-10-28 开源对标调研（GitHub 上有没有类似的调度执行器）
+
+- 目的：给自研执行器找参照/替代，判断是否重复造轮子。
+- 方法：GitHub API 抓 star/语言/最近推送，逐项目 README 关键词核对（2026-10-28 抓取，**均未在本机部署实测**）；未跑任何压测。
+- 结论：**有同类，但没有覆盖本场景的现成项目；继续自研，抄机制不抄代码。** 本场景组合 = 无头 API + token + 平台心跳注册 + 幂等指纹 + 并发上限 + 脚本目录扫描 + Windows 计划任务 + 看门狗，开源里没有一家同时具备。
+- 三类项目：①脚本执行器：bugy/script-server 1.9k★ Python（Web UI 跑脚本，Windows 仅附加支持/轻测）、OliveTin 3.9k★ Go（预定义命令 + REST/Connect RPC API）、Cronicle 5.9k★ Node（多机调度 + REST API + API Key）、Dkron 4.7k★ Go（分布式 cron + REST API，README 称支持 Windows）、Rundeck 6.4k★ Java（自助运维 + ACL + REST）；②调度中心 + 执行器：XXL-JOB 30.6k★ Java（执行器周期自动注册、Cron/固定间隔/API 触发、阻塞策略、超时中断、失败重试与告警、GLUE 脚本任务含 PowerShell、OpenAPI、审计日志）、PowerJob 7.8k★、Nomad 17k★（HTTP API 提交 batch）、StackStorm 6.5k★、Semaphore 14.3k★（Ansible/Terraform/PowerShell）；③重工作流（不适用）：Airflow 47k★、Kestra 30k★、Windmill 18k★、DolphinScheduler 14.5k★、Temporal 24k★、n8n 208k★。
+- 可借鉴（对上测评遗留项）：xxl-job 的阻塞策略（单机串行/丢弃/覆盖、比裸 429 友好）/超时主动中断/失败重试与告警/审计日志 → 对应 P0「无审计」与 P1「429 无 Retry-After」；bugy/script-server、OliveTin 的 action 定义与参数校验 → 若以后要给人手动跑；Cronicle 的 API Key 模型 → 若要多系统接入；WinSW 14.4k★ → 可替代「计划任务 + 看门狗」的更稳进程托管。
+- 不做：不迁移不替换（平台侧 `/run`、`/health/ready` 契约要重写，收益远小于成本）。
 
 ### 2026-10-28 文档与现架构对齐（P1-5）+ 清理旧架构记录
 

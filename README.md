@@ -1,6 +1,6 @@
 # ScriptServer
 
-Windows 上的独立脚本执行器（script-server，FastAPI + uvicorn，VERSION 3.2.0），
+Windows 上的独立脚本执行器（script-server，FastAPI + uvicorn，VERSION 3.3.0），
 供工作流平台「设备管理」派发脚本；由 Windows 计划任务直接托管 `python deploy\serve.py`（单 worker，`0.0.0.0:9000`）。
 
 ## 文档
