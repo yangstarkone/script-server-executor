@@ -7,7 +7,11 @@
 做的事：
   1) 读取同目录上一级的 .env（已存在的环境变量优先，便于临时覆盖）；
   2) 设定 WF_BIND_HOST / PYTHONIOENCODING（不设 PYTHONUTF8，避免改变业务脚本 open() 编码）；
-  3) 把 stdout/stderr 重定向到 logs\\script-server-out.log / -error.log（UTF-8、行缓冲）；
+  3) 日志拆成三份并**按天轮转、保留 14 天**（不依赖任何外部轮转工具）：
+       logs\\script-server-access.log  访问日志（一次 HTTP 请求一行）
+       logs\\script-server-out.log     服务/业务日志（INFO 及以上）
+       logs\\script-server-error.log   仅 ERROR 及以上（真正需要盯的那份）
+     轮转文件名为 <文件名>.YYYY-MM-DD，超过 14 个自动删最旧；
   4) 在当前进程内启动 uvicorn（workers=1，不 fork）。
 
 用法：
@@ -20,13 +24,21 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import time
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent          # ...\script-server
 LOG_DIR = ROOT / "logs"
+LOG_BACKUP_DAYS = 14                                   # 保留的历史日志份数（一天一份）
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+ACCESS_LOG = "script-server-access.log"
+SERVICE_LOG = "script-server-out.log"
+ERROR_LOG = "script-server-error.log"
 
 
 def load_env(path: Path) -> None:
@@ -46,6 +58,62 @@ def load_env(path: Path) -> None:
             os.environ[key] = value
 
 
+def _rotating_handler(path: Path, level: int, when: str, backup_count: int) -> TimedRotatingFileHandler:
+    """按天轮转的文件 handler：到点把当前文件改名为 <name>.YYYY-MM-DD，保留 backup_count 份。"""
+    handler = TimedRotatingFileHandler(
+        path,
+        when=when,
+        interval=1,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    return handler
+
+
+def setup_logging(
+    log_dir: Path = LOG_DIR,
+    *,
+    when: str = "midnight",
+    backup_count: int = LOG_BACKUP_DAYS,
+) -> bool:
+    """配置访问/业务/错误三份日志。
+
+    访问日志单独挂到 uvicorn.access 并关闭向 root 传播（否则每条请求会在 out.log 里重复一份）；
+    业务与错误两份都挂 root：ERROR 会同时出现在 out.log（完整时间线）和 error.log（只读错误）。
+    日志目录不可写时降级为 stderr，函数返回 False，**不阻止服务启动**。
+    """
+    root = logging.getLogger()
+    for old in list(root.handlers):
+        root.removeHandler(old)
+        old.close()
+
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        access = _rotating_handler(log_dir / ACCESS_LOG, logging.INFO, when, backup_count)
+        service = _rotating_handler(log_dir / SERVICE_LOG, logging.INFO, when, backup_count)
+        error = _rotating_handler(log_dir / ERROR_LOG, logging.ERROR, when, backup_count)
+    except OSError as exc:
+        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+        logging.getLogger("serve").warning(
+            "日志文件不可用（%s），已降级为 stderr：%s", log_dir, exc
+        )
+        return False
+
+    root.setLevel(logging.INFO)
+    root.addHandler(service)
+    root.addHandler(error)
+
+    access_logger = logging.getLogger("uvicorn.access")
+    for old in list(access_logger.handlers):
+        access_logger.removeHandler(old)
+        old.close()
+    access_logger.addHandler(access)
+    access_logger.propagate = False
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="script-server standalone launcher")
     parser.add_argument("--host", default=None, help="监听地址，默认取 WF_BIND_HOST 或 0.0.0.0")
@@ -60,37 +128,34 @@ def main() -> int:
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    out = open(LOG_DIR / "script-server-out.log", "a", encoding="utf-8", errors="replace", buffering=1)
-    err = open(LOG_DIR / "script-server-error.log", "a", encoding="utf-8", errors="replace", buffering=1)
-    sys.stdout = out
-    sys.stderr = err
+    logging_ok = setup_logging(LOG_DIR)
+    log = logging.getLogger("serve")
 
     sys.path.insert(0, str(ROOT))
     try:
         import uvicorn
         from script_server import VERSION, app
     except Exception:                                   # 依赖缺失/语法错误时给出可读原因
-        import traceback
-        traceback.print_exc()
-        print(f"[serve] 启动失败：{time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+        log.exception("[serve] 启动失败：导入依赖/代码出错")
         return 1
 
-    print(
-        f"[serve] start pid={os.getpid()} version={VERSION} host={host} port={port} "
-        f"scripts={os.environ.get('WF_SCRIPTS_DIR', '')} "
-        f"state={os.environ.get('WF_SCRIPT_STATE_DIR', '')} "
-        f"at={time.strftime('%Y-%m-%d %H:%M:%S')}",
-        flush=True,
+    log.info(
+        "[serve] start pid=%s version=%s host=%s port=%s scripts=%s state=%s at=%s",
+        os.getpid(), VERSION, host, port,
+        os.environ.get("WF_SCRIPTS_DIR", ""),
+        os.environ.get("WF_SCRIPT_STATE_DIR", ""),
+        time.strftime("%Y-%m-%d %H:%M:%S"),
     )
+    if not logging_ok:
+        log.warning("[serve] 文件日志未启用（见上一条 WARNING），本次仅输出到 stderr")
+
     try:
-        # workers 不传 = 进程内单 worker；log_config=None 沿用 script_server 的 logging 配置
+        # workers 不传 = 进程内单 worker；log_config=None 沿用本文件的 logging 配置
         uvicorn.run(app, host=host, port=port, log_config=None, access_log=True)
     except Exception:
-        import traceback
-        traceback.print_exc()
+        log.exception("[serve] uvicorn 运行异常退出")
         return 1
-    print(f"[serve] exit at={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    log.info("[serve] exit at=%s", time.strftime("%Y-%m-%d %H:%M:%S"))
     return 0
 
 

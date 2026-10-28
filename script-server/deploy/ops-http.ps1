@@ -1,4 +1,4 @@
-﻿# ops-http.ps1 - script-server day-2 operations over HTTP + log files + task control.
+# ops-http.ps1 - script-server day-2 operations over HTTP + log files + task control.
 #
 # Architecture: the Windows scheduled task `WorkflowPlatform-ScriptServer` runs
 # `python deploy\serve.py` directly (AtStartup / S4U / Highest). The task process
@@ -31,8 +31,9 @@ $Root     = Split-Path -Parent $PSScriptRoot        # ...\script-server
 $Base     = 'http://127.0.0.1:9000'
 $TaskName = 'WorkflowPlatform-ScriptServer'
 $CutoverLog = Join-Path (Split-Path -Parent $Root) 'logs\cutover.log'
-$OutLog   = Join-Path $Root 'logs\script-server-out.log'
-$ErrLog   = Join-Path $Root 'logs\script-server-error.log'
+$OutLog   = Join-Path $Root 'logs\script-server-out.log'      # service/business log, INFO+
+$ErrLog   = Join-Path $Root 'logs\script-server-error.log'    # ERROR+ only
+$AccessLog = Join-Path $Root 'logs\script-server-access.log'  # access log, one line per request
 
 function Get-Token {
     $t = $null
@@ -88,11 +89,18 @@ switch ($Action) {
     }
 
     'logs' {
-        foreach ($f in @($OutLog, $ErrLog)) {
+        # 3 files, rotated daily and kept for 14 days; archived names look like <name>.YYYY-MM-DD
+        foreach ($f in @($OutLog, $ErrLog, $AccessLog)) {
             Write-Host ("===== " + $f + " =====")
             if (Test-Path -LiteralPath $f) {
                 Get-Content -LiteralPath $f -Encoding UTF8 -Tail $Lines
             } else { Write-Host '(missing)' }
+        }
+        $archived = @(Get-ChildItem -LiteralPath (Join-Path $Root 'logs') -Filter 'script-server-*.log.*' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 5)
+        if ($archived) {
+            Write-Host '===== archived (newest 5) ====='
+            $archived | ForEach-Object { Write-Host ("{0}  {1,10:N0} B  {2}" -f $_.Name, $_.Length, $_.LastWriteTime) }
         }
         Write-Host ("===== " + $CutoverLog + " =====")
         if (Test-Path -LiteralPath $CutoverLog) { Get-Content -LiteralPath $CutoverLog -Encoding UTF8 -Tail $Lines }
